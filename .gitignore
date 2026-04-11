@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# 環境變數（絕對不能 commit）
+.env
+.env.*
+
+# SQLite 資料庫（本機資料，不需要版控）
+*.db
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store

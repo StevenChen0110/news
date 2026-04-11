@@ -1,0 +1,19 @@
+name: Scheduled News Push
+
+on:
+  schedule:
+    # UTC 時間（台北 = UTC+8）
+    - cron: "0 1 * * *"   # 台北 09:00
+    - cron: "0 5 * * *"   # 台北 13:00
+    - cron: "0 14 * * *"  # 台北 22:00
+  workflow_dispatch:       # 手動觸發（測試用）
+
+jobs:
+  push-news:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger news push
+        run: |
+          curl -s -X POST "${{ secrets.APP_URL }}/trigger-push" \
+            -H "Authorization: Bearer ${{ secrets.PUSH_SECRET }}" \
+            --fail-with-body

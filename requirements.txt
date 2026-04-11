@@ -1,0 +1,4 @@
+flask>=3.0.0
+line-bot-sdk>=3.11.0
+feedparser>=6.0.0
+gunicorn>=22.0.0
