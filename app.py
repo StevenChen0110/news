@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import sqlite3
+import anthropic
 from urllib.parse import quote
 
 import feedparser
@@ -23,6 +24,9 @@ CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 USER_ID              = os.getenv("LINE_USER_ID")   # 首次部署可留空
 PUSH_SECRET          = os.getenv("PUSH_SECRET", "change-me")  # 保護排程 endpoint
 DB_PATH              = os.getenv("DB_PATH", "subscriptions.db")
+ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY")
+
+claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 
 parser        = WebhookParser(CHANNEL_SECRET)
 configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
@@ -64,17 +68,49 @@ def remove_subscription(topic: str) -> bool:
 
 # ── 新聞抓取 ──────────────────────────────────────────────────────────────
 def fetch_news(topic: str, count: int = 3) -> list[dict]:
-    """使用 Google News RSS 抓取台灣中文新聞"""
+    """抓取新聞：有 Claude API 則用 AI 篩選最重要的，否則直接回傳 RSS 前幾則"""
     query = quote(topic)
     url = (
         f"https://news.google.com/rss/search"
         f"?q={query}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
     )
     feed = feedparser.parse(url)
-    return [
+    candidates = [
         {"title": e.title, "link": e.link}
-        for e in feed.entries[:count]
+        for e in feed.entries[:10]   # 多抓幾則，給 AI 挑選
     ]
+
+    if not candidates:
+        return []
+
+    # 有 Claude API：讓 AI 從候選中選出最重要的 3 則
+    if claude and len(candidates) > count:
+        try:
+            news_text = "\n".join(
+                f"{i+1}. {n['title']}" for i, n in enumerate(candidates)
+            )
+            resp = claude.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=256,
+                messages=[{
+                    "role": "user",
+                    "content": (
+                        f"以下是關於「{topic}」的新聞標題列表，"
+                        f"請選出最重要、最值得關注的 {count} 則，"
+                        f"只回傳編號，用逗號分隔，例如：2,5,7\n\n{news_text}"
+                    )
+                }]
+            )
+            picks = [
+                int(x.strip()) - 1
+                for x in resp.content[0].text.strip().split(",")
+                if x.strip().isdigit()
+            ]
+            return [candidates[i] for i in picks if i < len(candidates)][:count]
+        except Exception as e:
+            print(f"[WARN] Claude 篩選失敗，改用預設排序：{e}")
+
+    return candidates[:count]
 
 def format_news(topic: str, items: list[dict]) -> str:
     if not items:
