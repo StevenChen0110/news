@@ -179,13 +179,16 @@ def fetch_news(topic: str, count: int = 3) -> dict:
     else:
         candidates = candidates[:count]
 
-    # 平行處理：所有連結處理 + 綜合摘要同時進行
+    # 平行：解析 Google News 轉址 + 生成摘要
     titles = [c["title"] for c in candidates]
     with ThreadPoolExecutor(max_workers=len(candidates) + 1) as ex:
-        f_links   = [ex.submit(process_link, c["link"]) for c in candidates]
+        f_urls    = [ex.submit(resolve_url, c["link"]) for c in candidates]
         f_summary = ex.submit(get_combined_summary, topic, titles)
-        links   = [f.result() for f in f_links]
-        summary = f_summary.result()
+        real_urls = [f.result() for f in f_urls]
+        summary   = f_summary.result()
+
+    # 依序縮網址（避免同時打 API 觸發速率限制）
+    links = [shorten_url(url) for url in real_urls]
 
     return {
         "summary": summary,
