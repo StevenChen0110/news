@@ -91,29 +91,50 @@ def resolve_url(url: str) -> str:
     except Exception:
         return url
 
-# ── 新聞摘要 ──────────────────────────────────────────────────────────────
-def get_summary(title: str) -> str:
-    """用 AI 生成重點摘要；無 API Key 則回傳空字串"""
-    if claude:
-        try:
-            resp = claude.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=80,
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"根據以下新聞標題，用繁體中文寫 1～2 句話說明這則新聞的重點，"
-                        f"不要重複標題，直接給重點說明即可：\n{title}"
-                    )
-                }]
-            )
-            return resp.content[0].text.strip()
-        except Exception as e:
-            print(f"[WARN] 摘要生成失敗：{e}")
+def shorten_url(url: str) -> str:
+    try:
+        r = requests.get(
+            "https://is.gd/create.php",
+            params={"format": "simple", "url": url},
+            timeout=5,
+        )
+        if r.status_code == 200 and r.text.startswith("https://is.gd/"):
+            return r.text.strip()
+    except Exception:
+        pass
+    return url
+
+def process_link(url: str) -> str:
+    """解析 Google News 轉址 → 縮網址"""
+    return shorten_url(resolve_url(url))
+
+# ── 綜合摘要（所有文章）────────────────────────────────────────────────
+def get_combined_summary(topic: str, titles: list[str]) -> str:
+    """用 Claude 綜合摘要多篇新聞重點；無 API Key 回傳空字串"""
+    if not claude:
+        return ""
+    try:
+        news_text = "\n".join(f"- {t}" for t in titles)
+        resp = claude.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=150,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"以下是今日「{topic}」相關新聞標題：\n{news_text}\n\n"
+                    f"請用繁體中文寫 2～3 句話綜合說明這些新聞的重點，"
+                    f"不要列點，直接寫成一段話。"
+                )
+            }]
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        print(f"[WARN] 摘要生成失敗：{e}")
     return ""
 
 # ── 新聞抓取 ──────────────────────────────────────────────────────────────
-def fetch_news(topic: str, count: int = 3) -> list[dict]:
+def fetch_news(topic: str, count: int = 3) -> dict:
+    """回傳 {"summary": str, "items": [{"title": str, "link": str}]}"""
     query = quote(topic)
     url = (
         f"https://news.google.com/rss/search"
@@ -123,7 +144,7 @@ def fetch_news(topic: str, count: int = 3) -> list[dict]:
     candidates = [{"title": e.title, "link": e.link} for e in feed.entries[:10]]
 
     if not candidates:
-        return []
+        return {"summary": "", "items": []}
 
     # AI 重要性排序
     if claude and len(candidates) > count:
@@ -152,27 +173,29 @@ def fetch_news(topic: str, count: int = 3) -> list[dict]:
     else:
         candidates = candidates[:count]
 
-    # 平行處理：每篇文章的摘要與網址解析同時進行
-    def enrich(item: dict) -> dict:
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            f_summary = ex.submit(get_summary, item["title"])
-            f_link    = ex.submit(resolve_url, item["link"])
-            return {"title": item["title"], "summary": f_summary.result(), "link": f_link.result()}
+    # 平行處理：所有連結處理 + 綜合摘要同時進行
+    titles = [c["title"] for c in candidates]
+    with ThreadPoolExecutor(max_workers=len(candidates) + 1) as ex:
+        f_links   = [ex.submit(process_link, c["link"]) for c in candidates]
+        f_summary = ex.submit(get_combined_summary, topic, titles)
+        links   = [f.result() for f in f_links]
+        summary = f_summary.result()
 
-    with ThreadPoolExecutor(max_workers=len(candidates)) as ex:
-        return list(ex.map(enrich, candidates))
+    return {
+        "summary": summary,
+        "items": [{"title": t, "link": l} for t, l in zip(titles, links)],
+    }
 
 # ── 格式化 ────────────────────────────────────────────────────────────────
-def format_news(topic: str, items: list[dict]) -> str:
+def format_news(topic: str, result: dict) -> str:
+    items = result.get("items", [])
     if not items:
         return f"「{topic}」目前找不到相關新聞"
     parts = [f"📰 {topic}"]
+    if result.get("summary"):
+        parts.append(f"\n{result['summary']}")
     for i, item in enumerate(items, 1):
-        block = f"\n{i}. {item['title']}"
-        if item.get("summary"):
-            block += f"\n📝 {item['summary']}"
-        block += f"\n🔗 {item['link']}"
-        parts.append(block)
+        parts.append(f"\n{i}. {item['title']}\n🔗 {item['link']}")
     return "\n".join(parts)
 
 # ── Line 推播 ─────────────────────────────────────────────────────────────
