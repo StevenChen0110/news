@@ -8,6 +8,7 @@ from urllib.parse import quote
 
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone, timedelta
 import feedparser
 from flask import Flask, request, abort, session, redirect, url_for, render_template_string
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -147,7 +148,28 @@ def fetch_news(topic: str, count: int = 3) -> dict:
         f"?q={query}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
     )
     feed = feedparser.parse(url)
-    candidates = [{"title": e.title, "link": e.link} for e in feed.entries[:10]]
+
+    now = datetime.now(timezone.utc)
+
+    def to_dict(e):
+        pub = None
+        if getattr(e, "published_parsed", None):
+            pub = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
+        return {"title": e.title, "link": e.link, "published": pub}
+
+    all_entries = [to_dict(e) for e in feed.entries[:20]]
+
+    # 優先抓一天內，不足則放寬到一個月
+    day_ago   = now - timedelta(days=1)
+    month_ago = now - timedelta(days=30)
+
+    candidates = [e for e in all_entries if e["published"] and e["published"] >= day_ago]
+    if len(candidates) < count:
+        candidates = [e for e in all_entries if e["published"] and e["published"] >= month_ago]
+    if not candidates:
+        candidates = all_entries  # fallback：無日期資訊就全取
+
+    candidates = candidates[:10]  # 最多 10 篇供 AI 挑選
 
     if not candidates:
         return {"summary": "", "items": []}
