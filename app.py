@@ -7,7 +7,7 @@ import requests
 from urllib.parse import quote
 
 import feedparser
-from flask import Flask, request, abort
+from flask import Flask, request, abort, session, redirect, url_for, render_template_string
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -29,6 +29,8 @@ USER_ID              = os.getenv("LINE_USER_ID")
 PUSH_SECRET          = os.getenv("PUSH_SECRET", "change-me")
 DB_PATH              = os.getenv("DB_PATH", "subscriptions.db")
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY")
+ADMIN_PASSWORD       = os.getenv("ADMIN_PASSWORD", "admin123")
+app.secret_key       = os.getenv("SECRET_KEY", os.urandom(24))
 
 claude        = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 parser        = WebhookParser(CHANNEL_SECRET)
@@ -299,6 +301,201 @@ def trigger_push():
 @app.route("/healthz")
 def healthz():
     return "ok", 200
+
+# ── 管理介面 ──────────────────────────────────────────────────────────────
+ADMIN_HTML = """
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>新聞 Bot 管理</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, sans-serif; background: #f5f5f5; color: #333; }
+  .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 20px; margin-bottom: 24px; color: #111; }
+  .card { background: #fff; border-radius: 12px; padding: 20px; margin-bottom: 20px;
+          box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  .card h2 { font-size: 15px; color: #666; margin-bottom: 14px; text-transform: uppercase;
+              letter-spacing: .5px; }
+  .tag-list { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .tag { display: flex; align-items: center; gap: 6px; background: #f0f0f0;
+         border-radius: 20px; padding: 6px 12px; font-size: 14px; }
+  .tag button { background: none; border: none; color: #999; cursor: pointer;
+                font-size: 16px; line-height: 1; padding: 0; }
+  .tag button:hover { color: #e00; }
+  .add-row { display: flex; gap: 8px; }
+  .add-row input { flex: 1; border: 1px solid #ddd; border-radius: 8px;
+                   padding: 10px 14px; font-size: 15px; outline: none; }
+  .add-row input:focus { border-color: #06c755; }
+  .add-row button { background: #06c755; color: #fff; border: none; border-radius: 8px;
+                    padding: 10px 18px; font-size: 15px; cursor: pointer; font-weight: 600; }
+  .add-row button:hover { background: #05b04c; }
+  .empty { color: #aaa; font-size: 14px; margin-bottom: 14px; }
+  .logout { font-size: 13px; color: #999; text-decoration: none; float: right; margin-top: 4px; }
+  .logout:hover { color: #e00; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>📰 新聞 Bot 管理 <a href="/admin/logout" class="logout">登出</a></h1>
+
+  <!-- 訂閱主題 -->
+  <div class="card">
+    <h2>訂閱主題</h2>
+    <div class="tag-list">
+      {% if subs %}
+        {% for t in subs %}
+        <span class="tag">
+          {{ t }}
+          <form method="post" action="/admin/subs/remove" style="display:inline">
+            <input type="hidden" name="topic" value="{{ t }}">
+            <button type="submit" title="刪除">×</button>
+          </form>
+        </span>
+        {% endfor %}
+      {% else %}
+        <p class="empty">目前沒有訂閱主題</p>
+      {% endif %}
+    </div>
+    <form method="post" action="/admin/subs/add" class="add-row">
+      <input name="topic" placeholder="輸入新主題，例如：體育" required>
+      <button type="submit">新增</button>
+    </form>
+  </div>
+
+  <!-- 推送時間 -->
+  <div class="card">
+    <h2>推送時間</h2>
+    <div class="tag-list">
+      {% if times %}
+        {% for t in times %}
+        <span class="tag">
+          ⏰ {{ t }}
+          <form method="post" action="/admin/times/remove" style="display:inline">
+            <input type="hidden" name="time" value="{{ t }}">
+            <button type="submit" title="刪除">×</button>
+          </form>
+        </span>
+        {% endfor %}
+      {% else %}
+        <p class="empty">目前沒有推送時間</p>
+      {% endif %}
+    </div>
+    <form method="post" action="/admin/times/add" class="add-row">
+      <input name="time" placeholder="HH:MM，例如：08:00" pattern="\\d{2}:\\d{2}" required>
+      <button type="submit">新增</button>
+    </form>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+LOGIN_HTML = """
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登入</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, sans-serif; background: #f5f5f5;
+         display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+  .card { background: #fff; border-radius: 12px; padding: 32px; width: 320px;
+          box-shadow: 0 1px 4px rgba(0,0,0,.1); }
+  h1 { font-size: 18px; margin-bottom: 20px; text-align: center; }
+  input { width: 100%; border: 1px solid #ddd; border-radius: 8px;
+          padding: 12px 14px; font-size: 15px; margin-bottom: 12px; outline: none; }
+  input:focus { border-color: #06c755; }
+  button { width: 100%; background: #06c755; color: #fff; border: none;
+           border-radius: 8px; padding: 12px; font-size: 16px;
+           font-weight: 600; cursor: pointer; }
+  button:hover { background: #05b04c; }
+  .error { color: #e00; font-size: 13px; margin-bottom: 10px; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>📰 新聞 Bot 管理</h1>
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+  <form method="post">
+    <input type="password" name="password" placeholder="請輸入密碼" autofocus>
+    <button type="submit">登入</button>
+  </form>
+</div>
+</body>
+</html>
+"""
+
+def admin_required(f):
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("admin"):
+            return redirect(url_for("admin_login"))
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route("/admin", methods=["GET"])
+@admin_required
+def admin_index():
+    return render_template_string(
+        ADMIN_HTML,
+        subs=get_subscriptions(),
+        times=get_push_times(),
+    )
+
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    error = None
+    if request.method == "POST":
+        if request.form.get("password") == ADMIN_PASSWORD:
+            session["admin"] = True
+            return redirect(url_for("admin_index"))
+        error = "密碼錯誤"
+    return render_template_string(LOGIN_HTML, error=error)
+
+@app.route("/admin/logout")
+def admin_logout():
+    session.clear()
+    return redirect(url_for("admin_login"))
+
+@app.route("/admin/subs/add", methods=["POST"])
+@admin_required
+def admin_subs_add():
+    topic = request.form.get("topic", "").strip()
+    if topic:
+        add_subscription(topic)
+    return redirect(url_for("admin_index"))
+
+@app.route("/admin/subs/remove", methods=["POST"])
+@admin_required
+def admin_subs_remove():
+    topic = request.form.get("topic", "").strip()
+    if topic:
+        remove_subscription(topic)
+    return redirect(url_for("admin_index"))
+
+@app.route("/admin/times/add", methods=["POST"])
+@admin_required
+def admin_times_add():
+    t = request.form.get("time", "").strip()
+    if re.match(r"^\d{2}:\d{2}$", t):
+        if add_push_time(t):
+            register_push_jobs()
+    return redirect(url_for("admin_index"))
+
+@app.route("/admin/times/remove", methods=["POST"])
+@admin_required
+def admin_times_remove():
+    t = request.form.get("time", "").strip()
+    if t:
+        remove_push_time(t)
+        register_push_jobs()
+    return redirect(url_for("admin_index"))
 
 # ── 啟動 ──────────────────────────────────────────────────────────────────
 init_db()
