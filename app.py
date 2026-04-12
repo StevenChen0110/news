@@ -7,6 +7,7 @@ import requests
 from urllib.parse import quote
 
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import feedparser
 from flask import Flask, request, abort, session, redirect, url_for, render_template_string
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -151,15 +152,15 @@ def fetch_news(topic: str, count: int = 3) -> list[dict]:
     else:
         candidates = candidates[:count]
 
-    # 加上摘要與縮網址
-    return [
-        {
-            "title": item["title"],
-            "summary": get_summary(item["title"]),
-            "link": resolve_url(item["link"]),
-        }
-        for item in candidates
-    ]
+    # 平行處理：每篇文章的摘要與網址解析同時進行
+    def enrich(item: dict) -> dict:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_summary = ex.submit(get_summary, item["title"])
+            f_link    = ex.submit(resolve_url, item["link"])
+            return {"title": item["title"], "summary": f_summary.result(), "link": f_link.result()}
+
+    with ThreadPoolExecutor(max_workers=len(candidates)) as ex:
+        return list(ex.map(enrich, candidates))
 
 # ── 格式化 ────────────────────────────────────────────────────────────────
 def format_news(topic: str, items: list[dict]) -> str:
