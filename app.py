@@ -98,24 +98,24 @@ def shorten_url(url: str) -> str:
 
 # ── 新聞摘要 ──────────────────────────────────────────────────────────────
 def get_summary(title: str) -> str:
-    """約 20 字摘要：有 Claude 就用 AI，否則截取標題"""
+    """用 AI 生成重點摘要；無 API Key 則回傳空字串"""
     if claude:
         try:
             resp = claude.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=64,
+                max_tokens=80,
                 messages=[{
                     "role": "user",
                     "content": (
-                        f"根據以下新聞標題，用繁體中文寫一句約 20 字的重點摘要"
-                        f"（不要重複標題原文，直接給摘要即可）：\n{title}"
+                        f"根據以下新聞標題，用繁體中文寫 1～2 句話說明這則新聞的重點，"
+                        f"不要重複標題，直接給重點說明即可：\n{title}"
                     )
                 }]
             )
             return resp.content[0].text.strip()
         except Exception as e:
             print(f"[WARN] 摘要生成失敗：{e}")
-    return title[:22] + ("…" if len(title) > 22 else "")
+    return ""
 
 # ── 新聞抓取 ──────────────────────────────────────────────────────────────
 def fetch_news(topic: str, count: int = 3) -> list[dict]:
@@ -173,7 +173,11 @@ def format_news(topic: str, items: list[dict]) -> str:
         return f"「{topic}」目前找不到相關新聞"
     parts = [f"📰 {topic}"]
     for i, item in enumerate(items, 1):
-        parts.append(f"\n{i}. {item['summary']}\n🔗 {item['link']}")
+        block = f"\n{i}. {item['title']}"
+        if item.get("summary"):
+            block += f"\n📝 {item['summary']}"
+        block += f"\n🔗 {item['link']}"
+        parts.append(block)
     return "\n".join(parts)
 
 # ── Line 推播 ─────────────────────────────────────────────────────────────
