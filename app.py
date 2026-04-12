@@ -82,19 +82,13 @@ def remove_push_time(t: str) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
         return conn.execute("DELETE FROM push_times WHERE time=?", (t,)).rowcount > 0
 
-# ── URL 縮網址（is.gd 免費 API）──────────────────────────────────────────
-def shorten_url(url: str) -> str:
+# ── 取得實際文章網址（跟隨 Google News 轉址）────────────────────────────
+def resolve_url(url: str) -> str:
     try:
-        r = requests.get(
-            "https://is.gd/create.php",
-            params={"format": "simple", "url": url},
-            timeout=5,
-        )
-        if r.status_code == 200 and r.text.startswith("https://is.gd/"):
-            return r.text.strip()
+        r = requests.head(url, allow_redirects=True, timeout=5)
+        return r.url
     except Exception:
-        pass
-    return url  # fallback
+        return url
 
 # ── 新聞摘要 ──────────────────────────────────────────────────────────────
 def get_summary(title: str) -> str:
@@ -162,7 +156,7 @@ def fetch_news(topic: str, count: int = 3) -> list[dict]:
         {
             "title": item["title"],
             "summary": get_summary(item["title"]),
-            "link": shorten_url(item["link"]),
+            "link": resolve_url(item["link"]),
         }
         for item in candidates
     ]
