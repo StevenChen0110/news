@@ -31,6 +31,7 @@ USER_ID              = os.getenv("LINE_USER_ID")
 PUSH_SECRET          = os.getenv("PUSH_SECRET", "change-me")
 DB_PATH              = os.getenv("DB_PATH", "subscriptions.db")
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY")
+REURL_API_KEY        = os.getenv("REURL_API_KEY")
 ADMIN_PASSWORD       = os.getenv("ADMIN_PASSWORD", "admin123")
 app.secret_key       = os.getenv("SECRET_KEY", os.urandom(24))
 
@@ -86,20 +87,25 @@ def remove_push_time(t: str) -> bool:
 # ── 取得實際文章網址（跟隨 Google News 轉址）────────────────────────────
 def resolve_url(url: str) -> str:
     try:
-        r = requests.head(url, allow_redirects=True, timeout=5)
+        r = requests.get(url, allow_redirects=True, timeout=5, stream=True)
+        r.close()
         return r.url
     except Exception:
         return url
 
 def shorten_url(url: str) -> str:
+    if not REURL_API_KEY:
+        return url
     try:
-        r = requests.get(
-            "https://is.gd/create.php",
-            params={"format": "simple", "url": url},
+        r = requests.post(
+            "https://api.reurl.cc/shorten",
+            json={"url": url},
+            headers={"Content-Type": "application/json", "reurl-api-key": REURL_API_KEY},
             timeout=5,
         )
-        if r.status_code == 200 and r.text.startswith("https://is.gd/"):
-            return r.text.strip()
+        data = r.json()
+        if data.get("res") == "success":
+            return data["short_url"]
     except Exception:
         pass
     return url
