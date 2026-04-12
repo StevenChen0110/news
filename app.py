@@ -6,6 +6,7 @@ import anthropic
 import requests
 from urllib.parse import quote
 
+import threading
 import feedparser
 from flask import Flask, request, abort, session, redirect, url_for, render_template_string
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -209,6 +210,17 @@ def register_push_jobs() -> None:
         )
 
 # ── Webhook ───────────────────────────────────────────────────────────────
+def _process_event(text: str, user_id: str) -> None:
+    """在背景執行緒處理訊息，用 push_message 回傳結果（避免 reply token 超時）"""
+    try:
+        reply = _handle_command(text, user_id)
+        with ApiClient(configuration) as api_client:
+            MessagingApi(api_client).push_message(
+                PushMessageRequest(to=user_id, messages=[TextMessage(text=reply)])
+            )
+    except Exception as e:
+        print(f"[ERROR] 處理訊息失敗：{e}")
+
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers.get("X-Line-Signature", "")
@@ -221,14 +233,13 @@ def callback():
     for event in events:
         if not isinstance(event, MessageEvent) or not isinstance(event.message, TextMessageContent):
             continue
-        reply = _handle_command(event.message.text.strip(), event.source.user_id)
-        with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).reply_message(
-                ReplyMessageRequest(
-                    reply_token=event.reply_token,
-                    messages=[TextMessage(text=reply)],
-                )
-            )
+        # 立刻在背景處理，讓 webhook 馬上回傳 200
+        threading.Thread(
+            target=_process_event,
+            args=(event.message.text.strip(), event.source.user_id),
+            daemon=True,
+        ).start()
+
     return "OK"
 
 def _handle_command(text: str, sender_id: str) -> str:
