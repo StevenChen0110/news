@@ -21,7 +21,7 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
     ReplyMessageRequest, TextMessage,
-    PushMessageRequest,
+    PushMessageRequest, QuickReply, QuickReplyItem, MessageAction,
 )
 
 app = Flask(__name__)
@@ -29,7 +29,6 @@ app = Flask(__name__)
 # ── 環境變數 ──────────────────────────────────────────────────────────────
 CHANNEL_SECRET       = os.environ["LINE_CHANNEL_SECRET"]
 CHANNEL_ACCESS_TOKEN = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
-USER_ID              = os.getenv("LINE_USER_ID")
 PUSH_SECRET          = os.getenv("PUSH_SECRET", "change-me")
 DB_PATH              = os.getenv("DB_PATH", "subscriptions.db")
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY")
@@ -63,44 +62,102 @@ def set_cached(topic: str, result: dict) -> None:
 # ── SQLite ────────────────────────────────────────────────────────────────
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS subscriptions (topic TEXT PRIMARY KEY)")
-        conn.execute("CREATE TABLE IF NOT EXISTS push_times (time TEXT PRIMARY KEY)")
+        # 用戶表
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                created_at TEXT DEFAULT (datetime('now'))
+            )
+        """)
+        # 每人訂閱
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                user_id TEXT NOT NULL,
+                topic   TEXT NOT NULL,
+                PRIMARY KEY (user_id, topic)
+            )
+        """)
+        # 每人推送時間
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS push_times (
+                user_id TEXT NOT NULL,
+                time    TEXT NOT NULL,
+                PRIMARY KEY (user_id, time)
+            )
+        """)
+
+def register_user(user_id: str) -> bool:
+    """首次出現的用戶：自動設定預設訂閱與推送時間。回傳 True 表示新用戶。"""
+    with sqlite3.connect(DB_PATH) as conn:
+        if conn.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone():
+            return False
+        conn.execute("INSERT INTO users VALUES (?, datetime('now'))", (user_id,))
         for t in DEFAULT_TOPICS:
-            conn.execute("INSERT OR IGNORE INTO subscriptions VALUES (?)", (t,))
+            conn.execute("INSERT OR IGNORE INTO subscriptions VALUES (?,?)", (user_id, t))
         for t in DEFAULT_TIMES:
-            conn.execute("INSERT OR IGNORE INTO push_times VALUES (?)", (t,))
+            conn.execute("INSERT OR IGNORE INTO push_times VALUES (?,?)", (user_id, t))
+    return True
 
-def get_subscriptions() -> list[str]:
+def get_all_users() -> list[str]:
     with sqlite3.connect(DB_PATH) as conn:
-        return [r[0] for r in conn.execute("SELECT topic FROM subscriptions ORDER BY topic")]
+        return [r[0] for r in conn.execute("SELECT user_id FROM users ORDER BY created_at")]
 
-def add_subscription(topic: str) -> bool:
+def get_subscriptions(user_id: str) -> list[str]:
+    with sqlite3.connect(DB_PATH) as conn:
+        return [r[0] for r in conn.execute(
+            "SELECT topic FROM subscriptions WHERE user_id=? ORDER BY topic", (user_id,)
+        )]
+
+def get_all_subscriptions() -> list[str]:
+    """取得所有用戶的不重複主題（供預抓快取用）"""
+    with sqlite3.connect(DB_PATH) as conn:
+        return [r[0] for r in conn.execute("SELECT DISTINCT topic FROM subscriptions")]
+
+def add_subscription(user_id: str, topic: str) -> bool:
     try:
         with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("INSERT INTO subscriptions VALUES (?)", (topic,))
+            conn.execute("INSERT INTO subscriptions VALUES (?,?)", (user_id, topic))
         return True
     except sqlite3.IntegrityError:
         return False
 
-def remove_subscription(topic: str) -> bool:
+def remove_subscription(user_id: str, topic: str) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute("DELETE FROM subscriptions WHERE topic=?", (topic,)).rowcount > 0
+        return conn.execute(
+            "DELETE FROM subscriptions WHERE user_id=? AND topic=?", (user_id, topic)
+        ).rowcount > 0
 
-def get_push_times() -> list[str]:
+def get_push_times(user_id: str) -> list[str]:
     with sqlite3.connect(DB_PATH) as conn:
-        return sorted(r[0] for r in conn.execute("SELECT time FROM push_times"))
+        return sorted(r[0] for r in conn.execute(
+            "SELECT time FROM push_times WHERE user_id=?", (user_id,)
+        ))
 
-def add_push_time(t: str) -> bool:
+def get_all_push_times() -> list[str]:
+    """取得所有用戶的不重複推送時間（供排程器用）"""
+    with sqlite3.connect(DB_PATH) as conn:
+        return sorted(set(r[0] for r in conn.execute("SELECT DISTINCT time FROM push_times")))
+
+def get_users_for_time(time_str: str) -> list[str]:
+    """取得設定了某個推送時間的所有用戶"""
+    with sqlite3.connect(DB_PATH) as conn:
+        return [r[0] for r in conn.execute(
+            "SELECT user_id FROM push_times WHERE time=?", (time_str,)
+        )]
+
+def add_push_time(user_id: str, t: str) -> bool:
     try:
         with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("INSERT INTO push_times VALUES (?)", (t,))
+            conn.execute("INSERT INTO push_times VALUES (?,?)", (user_id, t))
         return True
     except sqlite3.IntegrityError:
         return False
 
-def remove_push_time(t: str) -> bool:
+def remove_push_time(user_id: str, t: str) -> bool:
     with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute("DELETE FROM push_times WHERE time=?", (t,)).rowcount > 0
+        return conn.execute(
+            "DELETE FROM push_times WHERE user_id=? AND time=?", (user_id, t)
+        ).rowcount > 0
 
 # ── 取得實際文章網址（跟隨 Google News 轉址）────────────────────────────
 def resolve_url(url: str) -> str:
@@ -127,10 +184,6 @@ def shorten_url(url: str) -> str:
     except Exception:
         pass
     return url
-
-def process_link(url: str) -> str:
-    """解析 Google News 轉址 → 縮網址"""
-    return shorten_url(resolve_url(url))
 
 # ── 新聞抓取 ──────────────────────────────────────────────────────────────
 def fetch_news(topic: str, count: int = 3) -> dict:
@@ -176,7 +229,7 @@ def _fetch_fresh(topic: str, count: int = 3) -> dict:
             snippet = ""
         return {"title": e.title, "link": e.link, "published": pub, "snippet": snippet}
 
-    all_entries = [to_dict(e) for e in feed.entries[:30]]  # 抓更多來源
+    all_entries = [to_dict(e) for e in feed.entries[:30]]
 
     # 優先一天內，不足放寬到一個月
     day_ago   = now - timedelta(days=1)
@@ -257,29 +310,55 @@ def format_news(topic: str, result: dict) -> str:
         parts.append(f"\n{i}. {item['title']}\n🔗 {item['link']}")
     return "\n".join(parts)
 
-# ── Line 推播 ─────────────────────────────────────────────────────────────
-def push_to_user(messages: list[str]) -> None:
-    if not USER_ID:
-        print("[WARN] LINE_USER_ID 未設定")
-        return
-    with ApiClient(configuration) as api_client:
-        api = MessagingApi(api_client)
-        for msg in messages:
-            api.push_message(PushMessageRequest(to=USER_ID, messages=[TextMessage(text=msg)]))
+def format_news_message(topic: str, result: dict) -> TextMessage:
+    text = format_news(topic, result)
+    qr = _qr((f"📌 訂閱「{topic[:8]}」", f"訂閱 {topic}"), ("📋 我的訂閱", "我的訂閱"))
+    return _msg(text, qr)
 
-def do_scheduled_push() -> None:
-    subs = get_subscriptions()
-    if not subs:
-        return
-    push_to_user([format_news(t, fetch_news(t)) for t in subs])
-    print(f"[INFO] 推播完成，{len(subs)} 個主題")
+# ── Quick Reply 常用組合 ──────────────────────────────────────────────────
+def _qr(*labels_and_texts: tuple[str, str]) -> QuickReply:
+    return QuickReply(items=[
+        QuickReplyItem(action=MessageAction(label=label, text=text))
+        for label, text in labels_and_texts
+    ])
+
+QR_MAIN     = _qr(("📋 我的訂閱", "我的訂閱"), ("⏰ 推送時間", "推送時間"), ("❓ 說明", "說明"))
+QR_SUBS     = _qr(("⏰ 推送時間", "推送時間"), ("❓ 說明", "說明"))
+QR_TIMES    = _qr(("📋 我的訂閱", "我的訂閱"), ("❓ 說明", "說明"))
+QR_AFTER_SUB = _qr(("📋 我的訂閱", "我的訂閱"), ("⏰ 推送時間", "推送時間"))
+
+def _msg(text: str, quick_reply: QuickReply | None = None) -> TextMessage:
+    return TextMessage(text=text, quick_reply=quick_reply)
+
+# ── LINE 推播 ─────────────────────────────────────────────────────────────
+def _send(user_id: str, msg: str | TextMessage) -> None:
+    if isinstance(msg, str):
+        msg = TextMessage(text=msg)
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).push_message(
+            PushMessageRequest(to=user_id, messages=[msg])
+        )
+
+def do_scheduled_push(time_str: str) -> None:
+    """推送給所有設定了此時間的用戶（各自的訂閱主題）"""
+    users = get_users_for_time(time_str)
+    for user_id in users:
+        subs = get_subscriptions(user_id)
+        if not subs:
+            continue
+        for topic in subs:
+            try:
+                _send(user_id, format_news_message(topic, fetch_news(topic)))
+            except Exception as e:
+                print(f"[WARN] 推播失敗 {user_id}/{topic}：{e}")
+    print(f"[INFO] {time_str} 推播完成，{len(users)} 位用戶")
 
 # ── APScheduler（動態管理推送時間）───────────────────────────────────────
 scheduler = BackgroundScheduler(timezone="Asia/Taipei")
 
 def prefetch_subscriptions() -> None:
-    """每 15 分鐘預抓訂閱主題，存入快取"""
-    for topic in get_subscriptions():
+    """每 15 分鐘預抓所有用戶訂閱的主題，存入快取"""
+    for topic in get_all_subscriptions():
         try:
             result = _fetch_fresh(topic)
             set_cached(topic, result)
@@ -291,13 +370,14 @@ def register_push_jobs() -> None:
     for job in scheduler.get_jobs():
         if job.id.startswith("push_"):
             job.remove()
-    for t in get_push_times():
+    for t in get_all_push_times():
         h, m = t.split(":")
         scheduler.add_job(
             do_scheduled_push,
             CronTrigger(hour=int(h), minute=int(m), timezone="Asia/Taipei"),
             id=f"push_{t}",
             replace_existing=True,
+            args=[t],
         )
     # 每 15 分鐘預抓訂閱主題
     scheduler.add_job(
@@ -310,15 +390,23 @@ def register_push_jobs() -> None:
 # ── Webhook ───────────────────────────────────────────────────────────────
 _COMMANDS = ("訂閱", "取消訂閱", "我的訂閱", "推送時間", "新增推送時間", "刪除推送時間", "說明", "help", "?", "？")
 
-def _send(user_id: str, text: str) -> None:
-    with ApiClient(configuration) as api_client:
-        MessagingApi(api_client).push_message(
-            PushMessageRequest(to=user_id, messages=[TextMessage(text=text)])
-        )
-
 def _process_event(text: str, user_id: str) -> None:
     """在背景執行緒處理訊息，用 push_message 回傳結果（避免 reply token 超時）"""
     try:
+        # 新用戶自動初始化
+        is_new = register_user(user_id)
+        if is_new:
+            register_push_jobs()  # 有新用戶時更新排程
+            _send(user_id, _msg(
+                "👋 歡迎使用新聞 Bot！\n\n"
+                f"已為你設定預設訂閱：{', '.join(DEFAULT_TOPICS)}\n"
+                f"推送時間：{', '.join(DEFAULT_TIMES)}\n\n"
+                "直接輸入關鍵字可即時查詢新聞\n"
+                "點下方按鈕管理你的設定 👇",
+                QR_MAIN
+            ))
+            return
+
         is_command = any(text.startswith(c) for c in _COMMANDS)
         # 快取 miss 且非指令 → 先送確認訊息
         if not is_command and get_cached(text) is None:
@@ -349,70 +437,93 @@ def callback():
 
     return "OK"
 
-def _handle_command(text: str, sender_id: str) -> str:
-    if not USER_ID:
-        return f"你的 User ID 是：\n{sender_id}\n\n請設定環境變數 LINE_USER_ID 後重新部署。"
-
+def _handle_command(text: str, user_id: str) -> TextMessage:
     # ── 訂閱管理 ──
     if text.startswith("訂閱 "):
         topic = text[3:].strip()
-        return (f"✅ 已訂閱「{topic}」" if add_subscription(topic) else f"「{topic}」已在訂閱清單") if topic else "請輸入主題，例如：訂閱 科技"
+        if not topic:
+            return _msg("請輸入主題，例如：訂閱 科技")
+        if add_subscription(user_id, topic):
+            return _msg(f"✅ 已訂閱「{topic}」\n\n之後每次推播都會包含此主題", QR_AFTER_SUB)
+        return _msg(f"「{topic}」已在訂閱清單", QR_AFTER_SUB)
 
     if text.startswith("取消訂閱 "):
         topic = text[5:].strip()
-        return (f"✅ 已取消訂閱「{topic}」" if remove_subscription(topic) else f"「{topic}」不在訂閱清單") if topic else "請輸入主題"
+        if not topic:
+            return _msg("請輸入主題")
+        if remove_subscription(user_id, topic):
+            return _msg(f"✅ 已取消訂閱「{topic}」", _qr(("📋 我的訂閱", "我的訂閱")))
+        return _msg(f"「{topic}」不在訂閱清單", _qr(("📋 我的訂閱", "我的訂閱")))
 
     if text == "我的訂閱":
-        subs = get_subscriptions()
-        return ("📋 訂閱主題：\n" + "\n".join(f"• {t}" for t in subs)) if subs else "目前沒有訂閱主題"
+        subs = get_subscriptions(user_id)
+        if subs:
+            body = "📋 訂閱主題：\n" + "\n".join(f"• {t}" for t in subs)
+            body += "\n\n要取消請輸入：取消訂閱 <主題>"
+        else:
+            body = "目前沒有訂閱主題\n\n輸入「訂閱 <主題>」來新增"
+        return _msg(body, QR_SUBS)
 
     # ── 推送時間管理 ──
     if text == "推送時間":
-        times = get_push_times()
-        return ("⏰ 推送時間：\n" + "\n".join(f"• {t}" for t in times)) if times else "目前沒有設定推送時間"
+        times = get_push_times(user_id)
+        if times:
+            body = "⏰ 推送時間：\n" + "\n".join(f"• {t}" for t in times)
+            body += "\n\n新增：新增推送時間 HH:MM\n刪除：刪除推送時間 HH:MM"
+        else:
+            body = "目前沒有設定推送時間\n\n輸入「新增推送時間 HH:MM」來新增"
+        return _msg(body, QR_TIMES)
 
     if text.startswith("新增推送時間 "):
         t = text[7:].strip()
         if not re.match(r"^\d{2}:\d{2}$", t):
-            return "格式錯誤，請輸入 HH:MM\n例如：新增推送時間 08:00"
-        if add_push_time(t):
+            return _msg("格式錯誤，請輸入 HH:MM\n例如：新增推送時間 08:00")
+        if add_push_time(user_id, t):
             register_push_jobs()
-            return f"✅ 已新增推送時間 {t}"
-        return f"⏰ {t} 已在推送清單"
+            return _msg(f"✅ 已新增推送時間 {t}", QR_TIMES)
+        return _msg(f"⏰ {t} 已在推送清單", QR_TIMES)
 
     if text.startswith("刪除推送時間 "):
         t = text[7:].strip()
-        if remove_push_time(t):
+        if remove_push_time(user_id, t):
             register_push_jobs()
-            return f"✅ 已刪除推送時間 {t}"
-        return f"❌ {t} 不在推送清單"
+            return _msg(f"✅ 已刪除推送時間 {t}", QR_TIMES)
+        return _msg(f"❌ {t} 不在推送清單", QR_TIMES)
 
     # ── 說明 ──
     if text in ("說明", "help", "?", "？"):
-        return (
-            "📖 指令說明\n\n"
+        return _msg(
+            "📖 使用說明\n\n"
             "【即時查詢】\n"
             "直接輸入任何關鍵字\n"
-            "→ 搜尋最重要 3 則新聞\n\n"
+            "例：台積電、升息、世界盃\n\n"
             "【訂閱管理】\n"
-            "訂閱 <主題>\n"
-            "取消訂閱 <主題>\n"
-            "我的訂閱\n\n"
-            "【推送時間管理】\n"
-            "推送時間\n"
+            "訂閱 <主題>　　新增定時推播\n"
+            "取消訂閱 <主題>　移除\n"
+            "我的訂閱　　　查看清單\n\n"
+            "【推送時間】\n"
+            "推送時間　　　　查看設定\n"
             "新增推送時間 HH:MM\n"
-            "刪除推送時間 HH:MM"
+            "刪除推送時間 HH:MM",
+            QR_MAIN
         )
 
     # 預設：即時查詢
-    return format_news(text, fetch_news(text))
+    return format_news_message(text, fetch_news(text))
 
 # ── 備用推播 endpoint ─────────────────────────────────────────────────────
 @app.route("/trigger-push", methods=["POST"])
 def trigger_push():
     if request.headers.get("Authorization") != f"Bearer {PUSH_SECRET}":
         abort(401)
-    do_scheduled_push()
+    # 推送所有用戶的所有主題
+    for user_id in get_all_users():
+        subs = get_subscriptions(user_id)
+        for topic in subs:
+            try:
+                _send(user_id, format_news_message(topic, fetch_news(topic)))
+            except Exception as e:
+                print(f"[WARN] trigger-push 失敗 {user_id}/{topic}：{e}")
     return "ok", 200
 
 # ── Keep-alive（給 UptimeRobot ping 用）──────────────────────────────────
@@ -431,8 +542,76 @@ ADMIN_HTML = """
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, sans-serif; background: #f5f5f5; color: #333; }
-  .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+  .container { max-width: 700px; margin: 0 auto; padding: 20px; }
   h1 { font-size: 20px; margin-bottom: 24px; color: #111; }
+  .card { background: #fff; border-radius: 12px; padding: 20px; margin-bottom: 20px;
+          box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+  .card h2 { font-size: 15px; color: #666; margin-bottom: 14px; text-transform: uppercase;
+              letter-spacing: .5px; }
+  .user-row { display: flex; align-items: center; gap: 10px; padding: 10px 0;
+              border-bottom: 1px solid #f0f0f0; }
+  .user-row:last-child { border-bottom: none; }
+  .user-id { font-family: monospace; font-size: 13px; color: #555; flex: 1; word-break: break-all; }
+  .badge { background: #06c755; color: #fff; border-radius: 20px; padding: 2px 10px;
+           font-size: 12px; white-space: nowrap; }
+  .tag-list { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .tag { display: flex; align-items: center; gap: 6px; background: #f0f0f0;
+         border-radius: 20px; padding: 6px 12px; font-size: 14px; }
+  .tag button { background: none; border: none; color: #999; cursor: pointer;
+                font-size: 16px; line-height: 1; padding: 0; }
+  .tag button:hover { color: #e00; }
+  .add-row { display: flex; gap: 8px; }
+  .add-row input { flex: 1; border: 1px solid #ddd; border-radius: 8px;
+                   padding: 10px 14px; font-size: 15px; outline: none; }
+  .add-row input:focus { border-color: #06c755; }
+  .add-row button { background: #06c755; color: #fff; border: none; border-radius: 8px;
+                    padding: 10px 18px; font-size: 15px; cursor: pointer; font-weight: 600; }
+  .add-row button:hover { background: #05b04c; }
+  .empty { color: #aaa; font-size: 14px; margin-bottom: 14px; }
+  .logout { font-size: 13px; color: #999; text-decoration: none; float: right; margin-top: 4px; }
+  .logout:hover { color: #e00; }
+  .section-title { font-size: 13px; color: #888; margin: 16px 0 8px; font-weight: 600; }
+  select { border: 1px solid #ddd; border-radius: 8px; padding: 10px 14px;
+           font-size: 14px; background: #fff; cursor: pointer; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>📰 新聞 Bot 管理 <a href="/admin/logout" class="logout">登出</a></h1>
+
+  <!-- 用戶列表 -->
+  <div class="card">
+    <h2>用戶列表（{{ users|length }} 人）</h2>
+    {% if users %}
+      {% for u in users %}
+      <div class="user-row">
+        <span class="user-id">{{ u.user_id }}</span>
+        <span class="badge">{{ u.sub_count }} 訂閱</span>
+        <a href="/admin/user/{{ u.user_id }}" style="font-size:13px; color:#06c755; text-decoration:none;">管理 →</a>
+      </div>
+      {% endfor %}
+    {% else %}
+      <p class="empty">目前沒有用戶（等待第一個人使用 Bot）</p>
+    {% endif %}
+  </div>
+</div>
+</body>
+</html>
+"""
+
+USER_ADMIN_HTML = """
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>管理用戶</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, sans-serif; background: #f5f5f5; color: #333; }
+  .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+  h1 { font-size: 18px; margin-bottom: 6px; color: #111; }
+  .uid { font-family: monospace; font-size: 12px; color: #888; margin-bottom: 20px; word-break: break-all; }
   .card { background: #fff; border-radius: 12px; padding: 20px; margin-bottom: 20px;
           box-shadow: 0 1px 4px rgba(0,0,0,.08); }
   .card h2 { font-size: 15px; color: #666; margin-bottom: 14px; text-transform: uppercase;
@@ -451,13 +630,14 @@ ADMIN_HTML = """
                     padding: 10px 18px; font-size: 15px; cursor: pointer; font-weight: 600; }
   .add-row button:hover { background: #05b04c; }
   .empty { color: #aaa; font-size: 14px; margin-bottom: 14px; }
-  .logout { font-size: 13px; color: #999; text-decoration: none; float: right; margin-top: 4px; }
-  .logout:hover { color: #e00; }
+  .back { font-size: 13px; color: #06c755; text-decoration: none; }
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>📰 新聞 Bot 管理 <a href="/admin/logout" class="logout">登出</a></h1>
+  <p style="margin-bottom:12px"><a href="/admin" class="back">← 返回用戶列表</a></p>
+  <h1>用戶管理</h1>
+  <p class="uid">{{ user_id }}</p>
 
   <!-- 訂閱主題 -->
   <div class="card">
@@ -467,7 +647,7 @@ ADMIN_HTML = """
         {% for t in subs %}
         <span class="tag">
           {{ t }}
-          <form method="post" action="/admin/subs/remove" style="display:inline">
+          <form method="post" action="/admin/user/{{ user_id }}/subs/remove" style="display:inline">
             <input type="hidden" name="topic" value="{{ t }}">
             <button type="submit" title="刪除">×</button>
           </form>
@@ -477,7 +657,7 @@ ADMIN_HTML = """
         <p class="empty">目前沒有訂閱主題</p>
       {% endif %}
     </div>
-    <form method="post" action="/admin/subs/add" class="add-row">
+    <form method="post" action="/admin/user/{{ user_id }}/subs/add" class="add-row">
       <input name="topic" placeholder="輸入新主題，例如：體育" required>
       <button type="submit">新增</button>
     </form>
@@ -491,7 +671,7 @@ ADMIN_HTML = """
         {% for t in times %}
         <span class="tag">
           ⏰ {{ t }}
-          <form method="post" action="/admin/times/remove" style="display:inline">
+          <form method="post" action="/admin/user/{{ user_id }}/times/remove" style="display:inline">
             <input type="hidden" name="time" value="{{ t }}">
             <button type="submit" title="刪除">×</button>
           </form>
@@ -501,7 +681,7 @@ ADMIN_HTML = """
         <p class="empty">目前沒有推送時間</p>
       {% endif %}
     </div>
-    <form method="post" action="/admin/times/add" class="add-row">
+    <form method="post" action="/admin/user/{{ user_id }}/times/add" class="add-row">
       <input name="time" placeholder="HH:MM，例如：08:00" pattern="\\d{2}:\\d{2}" required>
       <button type="submit">新增</button>
     </form>
@@ -560,11 +740,58 @@ def admin_required(f):
 @app.route("/admin", methods=["GET"])
 @admin_required
 def admin_index():
+    all_users = get_all_users()
+    users_data = []
+    for uid in all_users:
+        users_data.append({
+            "user_id": uid,
+            "sub_count": len(get_subscriptions(uid)),
+        })
+    return render_template_string(ADMIN_HTML, users=users_data)
+
+@app.route("/admin/user/<user_id>", methods=["GET"])
+@admin_required
+def admin_user(user_id: str):
     return render_template_string(
-        ADMIN_HTML,
-        subs=get_subscriptions(),
-        times=get_push_times(),
+        USER_ADMIN_HTML,
+        user_id=user_id,
+        subs=get_subscriptions(user_id),
+        times=get_push_times(user_id),
     )
+
+@app.route("/admin/user/<user_id>/subs/add", methods=["POST"])
+@admin_required
+def admin_user_subs_add(user_id: str):
+    topic = request.form.get("topic", "").strip()
+    if topic:
+        add_subscription(user_id, topic)
+    return redirect(url_for("admin_user", user_id=user_id))
+
+@app.route("/admin/user/<user_id>/subs/remove", methods=["POST"])
+@admin_required
+def admin_user_subs_remove(user_id: str):
+    topic = request.form.get("topic", "").strip()
+    if topic:
+        remove_subscription(user_id, topic)
+    return redirect(url_for("admin_user", user_id=user_id))
+
+@app.route("/admin/user/<user_id>/times/add", methods=["POST"])
+@admin_required
+def admin_user_times_add(user_id: str):
+    t = request.form.get("time", "").strip()
+    if re.match(r"^\d{2}:\d{2}$", t):
+        if add_push_time(user_id, t):
+            register_push_jobs()
+    return redirect(url_for("admin_user", user_id=user_id))
+
+@app.route("/admin/user/<user_id>/times/remove", methods=["POST"])
+@admin_required
+def admin_user_times_remove(user_id: str):
+    t = request.form.get("time", "").strip()
+    if t:
+        remove_push_time(user_id, t)
+        register_push_jobs()
+    return redirect(url_for("admin_user", user_id=user_id))
 
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
@@ -580,40 +807,6 @@ def admin_login():
 def admin_logout():
     session.clear()
     return redirect(url_for("admin_login"))
-
-@app.route("/admin/subs/add", methods=["POST"])
-@admin_required
-def admin_subs_add():
-    topic = request.form.get("topic", "").strip()
-    if topic:
-        add_subscription(topic)
-    return redirect(url_for("admin_index"))
-
-@app.route("/admin/subs/remove", methods=["POST"])
-@admin_required
-def admin_subs_remove():
-    topic = request.form.get("topic", "").strip()
-    if topic:
-        remove_subscription(topic)
-    return redirect(url_for("admin_index"))
-
-@app.route("/admin/times/add", methods=["POST"])
-@admin_required
-def admin_times_add():
-    t = request.form.get("time", "").strip()
-    if re.match(r"^\d{2}:\d{2}$", t):
-        if add_push_time(t):
-            register_push_jobs()
-    return redirect(url_for("admin_index"))
-
-@app.route("/admin/times/remove", methods=["POST"])
-@admin_required
-def admin_times_remove():
-    t = request.form.get("time", "").strip()
-    if t:
-        remove_push_time(t)
-        register_push_jobs()
-    return redirect(url_for("admin_index"))
 
 # ── 啟動 ──────────────────────────────────────────────────────────────────
 init_db()
