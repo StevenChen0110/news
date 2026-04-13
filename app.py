@@ -44,6 +44,22 @@ configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 DEFAULT_TOPICS = ["科技", "AI", "台灣", "國際", "財經"]
 DEFAULT_TIMES  = ["09:00", "13:00", "22:00"]
 
+# ── 新聞快取（15 分鐘 TTL）───────────────────────────────────────────────
+_news_cache: dict[str, tuple[datetime, dict]] = {}
+CACHE_TTL = timedelta(minutes=15)
+
+def get_cached(topic: str) -> dict | None:
+    entry = _news_cache.get(topic)
+    if entry:
+        cached_at, result = entry
+        if datetime.now(timezone.utc) - cached_at < CACHE_TTL:
+            return result
+        del _news_cache[topic]
+    return None
+
+def set_cached(topic: str, result: dict) -> None:
+    _news_cache[topic] = (datetime.now(timezone.utc), result)
+
 # ── SQLite ────────────────────────────────────────────────────────────────
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as conn:
@@ -116,41 +132,25 @@ def process_link(url: str) -> str:
     """解析 Google News 轉址 → 縮網址"""
     return shorten_url(resolve_url(url))
 
-# ── 綜合摘要（所有文章）────────────────────────────────────────────────
-def get_combined_summary(topic: str, titles: list[str]) -> str:
-    """用 Claude 綜合摘要多篇新聞重點；無 API Key 回傳空字串"""
-    if not claude:
-        return ""
-    try:
-        news_text = "\n".join(f"- {t}" for t in titles)
-        resp = claude.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=150,
-            messages=[{
-                "role": "user",
-                "content": (
-                    f"以下是今日「{topic}」相關新聞標題：\n{news_text}\n\n"
-                    f"請用繁體中文寫 2～3 句話綜合說明這些新聞的重點，"
-                    f"不要列點，直接寫成一段話。"
-                )
-            }]
-        )
-        return resp.content[0].text.strip()
-    except Exception as e:
-        print(f"[WARN] 摘要生成失敗：{e}")
-    return ""
-
 # ── 新聞抓取 ──────────────────────────────────────────────────────────────
 def fetch_news(topic: str, count: int = 3) -> dict:
-    """回傳 {"summary": str, "items": [{"title": str, "link": str}]}"""
+    """回傳 {"summary": str, "items": [{"title": str, "link": str}]}，有快取時直接回傳"""
+    cached = get_cached(topic)
+    if cached is not None:
+        return cached
+    result = _fetch_fresh(topic, count)
+    set_cached(topic, result)
+    return result
+
+def _fetch_fresh(topic: str, count: int = 3) -> dict:
+    """從網路抓取最新新聞（繞過快取）"""
     query = quote(topic)
     url = (
         f"https://news.google.com/rss/search"
         f"?q={query}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
     )
     feed = feedparser.parse(url)
-
-    now = datetime.now(timezone.utc)
+    now  = datetime.now(timezone.utc)
 
     def clean_text(raw: str) -> str:
         text = re.sub(r"<[^>]+>", " ", raw)
@@ -160,98 +160,89 @@ def fetch_news(topic: str, count: int = 3) -> dict:
     def age_label(pub: datetime | None) -> str:
         if not pub:
             return "時間不明"
-        diff = now - pub
+        diff  = now - pub
         hours = int(diff.total_seconds() / 3600)
-        if hours < 1:
-            return "不到1小時前"
-        if hours < 24:
-            return f"{hours}小時前"
+        if hours < 1:  return "不到1小時前"
+        if hours < 24: return f"{hours}小時前"
         return f"{diff.days}天前"
 
     def to_dict(e):
         pub = None
         if getattr(e, "published_parsed", None):
             pub = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
-        raw_summary = getattr(e, "summary", "") or ""
-        summary = clean_text(raw_summary)
-        # Google News summary 有時只是標題重複，去掉
-        if summary.lower().startswith(e.title[:20].lower()):
-            summary = ""
-        return {"title": e.title, "link": e.link, "published": pub, "summary": summary}
+        raw = getattr(e, "summary", "") or ""
+        snippet = clean_text(raw)
+        if snippet.lower().startswith(e.title[:20].lower()):
+            snippet = ""
+        return {"title": e.title, "link": e.link, "published": pub, "snippet": snippet}
 
-    all_entries = [to_dict(e) for e in feed.entries[:20]]
+    all_entries = [to_dict(e) for e in feed.entries[:30]]  # 抓更多來源
 
-    # 優先抓一天內，不足則放寬到一個月
+    # 優先一天內，不足放寬到一個月
     day_ago   = now - timedelta(days=1)
     month_ago = now - timedelta(days=30)
-
     candidates = [e for e in all_entries if e["published"] and e["published"] >= day_ago]
     if len(candidates) < count:
         candidates = [e for e in all_entries if e["published"] and e["published"] >= month_ago]
     if not candidates:
-        candidates = all_entries  # fallback：無日期資訊就全取
-
-    candidates = candidates[:10]  # 最多 10 篇供 AI 挑選
+        candidates = all_entries
+    candidates = candidates[:20]  # 最多 20 篇供 AI 挑選
 
     if not candidates:
         return {"summary": "", "items": []}
 
-    # AI 重要性排序（DCEM 模型）
+    # ── 單次 AI 呼叫：排序 + 摘要同時完成 ──────────────────────────────
+    selected = candidates[:count]
+    summary  = ""
     if claude and len(candidates) > count:
         try:
             news_lines = []
             for i, n in enumerate(candidates):
                 line = f"{i+1}. [{age_label(n['published'])}] {n['title']}"
-                if n.get("summary"):
-                    line += f"\n   摘錄：{n['summary'][:120]}"
+                if n.get("snippet"):
+                    line += f"\n   摘錄：{n['snippet'][:120]}"
                 news_lines.append(line)
             news_text = "\n".join(news_lines)
             resp = claude.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=16,
+                max_tokens=220,
                 messages=[{
                     "role": "user",
                     "content": (
-                        f"你是新聞重要性評估專家。以下是「{topic}」的新聞（含發布時間與摘錄），"
-                        f"請依照下列標準選出最重要的 {count} 則：\n\n"
+                        f"你是新聞重要性評估專家。以下是「{topic}」的新聞（含時間與摘錄）。\n\n"
                         f"【評估標準（依優先順序）】\n"
-                        f"1. 時效性（最高比重）：越新越優先；超過3天的舊聞需有極高價值才選\n"
-                        f"2. 影響規模：涉及範圍廣（跨產業/多國/大量人口）優先\n"
-                        f"3. 路徑決定性：結構性轉折、打破慣例、第一塊骨牌優先\n"
-                        f"4. 局勢連動：前提在當前仍成立（非過時背景）優先\n"
-                        f"5. 前瞻性：政策草案、技術突破等具先兆意義的優先\n"
+                        f"1. 時效性（最高比重 35%）：越新越優先；超過3天須有極高價值才選\n"
+                        f"2. 影響規模（20%）：涉及範圍廣（跨產業/多國/大量人口）\n"
+                        f"3. 路徑決定性（20%）：結構性轉折、打破慣例、第一塊骨牌\n"
+                        f"4. 媒體共識（15%）：同一事件出現多篇不同來源報導\n"
+                        f"5. 事實密度（10%）：有具體數字/數據，而非情緒評論\n"
                         f"6. 避免重複：同一事件只選一則\n\n"
-                        f"只回傳編號，用逗號分隔，例如：2,5,7\n\n"
+                        f"請完成兩件事，嚴格按以下格式回覆：\n"
+                        f"RANKS:編號,編號,編號\n"
+                        f"SUMMARY:2-3句繁體中文綜合重點\n\n"
                         f"{news_text}"
                     )
                 }]
             )
-            picks = [
-                int(x.strip()) - 1
-                for x in resp.content[0].text.strip().split(",")
-                if x.strip().isdigit()
-            ]
-            candidates = [candidates[i] for i in picks if i < len(candidates)][:count]
+            raw = resp.content[0].text.strip()
+            ranks_m   = re.search(r"RANKS:\s*([0-9,\s]+)", raw)
+            summary_m = re.search(r"SUMMARY:\s*(.+)", raw, re.DOTALL)
+            if ranks_m:
+                picks = [int(x.strip()) - 1 for x in ranks_m.group(1).split(",") if x.strip().isdigit()]
+                selected = [candidates[i] for i in picks if i < len(candidates)][:count]
+            if summary_m:
+                summary = summary_m.group(1).strip()
         except Exception as e:
-            print(f"[WARN] AI 排序失敗：{e}")
-            candidates = candidates[:count]
-    else:
-        candidates = candidates[:count]
+            print(f"[WARN] AI 分析失敗：{e}")
 
-    # 平行：解析 Google News 轉址 + 生成摘要
-    titles = [c["title"] for c in candidates]
-    with ThreadPoolExecutor(max_workers=len(candidates) + 1) as ex:
-        f_urls    = [ex.submit(resolve_url, c["link"]) for c in candidates]
-        f_summary = ex.submit(get_combined_summary, topic, titles)
-        real_urls = [f.result() for f in f_urls]
-        summary   = f_summary.result()
-
-    # 依序縮網址（避免同時打 API 觸發速率限制）
-    links = [shorten_url(url) for url in real_urls]
+    # 平行解析 URL，依序縮網址
+    with ThreadPoolExecutor(max_workers=len(selected)) as ex:
+        real_urls = list(ex.map(resolve_url, [c["link"] for c in selected]))
+    links = [shorten_url(u) for u in real_urls]
 
     return {
         "summary": summary,
-        "items": [{"title": t, "link": l} for t, l in zip(titles, links)],
+        "items": [{"title": c["title"], "link": l} for c, l in zip(selected, links)],
     }
 
 # ── 格式化 ────────────────────────────────────────────────────────────────
@@ -286,6 +277,16 @@ def do_scheduled_push() -> None:
 # ── APScheduler（動態管理推送時間）───────────────────────────────────────
 scheduler = BackgroundScheduler(timezone="Asia/Taipei")
 
+def prefetch_subscriptions() -> None:
+    """每 15 分鐘預抓訂閱主題，存入快取"""
+    for topic in get_subscriptions():
+        try:
+            result = _fetch_fresh(topic)
+            set_cached(topic, result)
+            print(f"[INFO] 預抓完成：{topic}")
+        except Exception as e:
+            print(f"[WARN] 預抓失敗 {topic}：{e}")
+
 def register_push_jobs() -> None:
     for job in scheduler.get_jobs():
         if job.id.startswith("push_"):
@@ -298,16 +299,32 @@ def register_push_jobs() -> None:
             id=f"push_{t}",
             replace_existing=True,
         )
+    # 每 15 分鐘預抓訂閱主題
+    scheduler.add_job(
+        prefetch_subscriptions,
+        CronTrigger(minute="*/15"),
+        id="prefetch",
+        replace_existing=True,
+    )
 
 # ── Webhook ───────────────────────────────────────────────────────────────
+_COMMANDS = ("訂閱", "取消訂閱", "我的訂閱", "推送時間", "新增推送時間", "刪除推送時間", "說明", "help", "?", "？")
+
+def _send(user_id: str, text: str) -> None:
+    with ApiClient(configuration) as api_client:
+        MessagingApi(api_client).push_message(
+            PushMessageRequest(to=user_id, messages=[TextMessage(text=text)])
+        )
+
 def _process_event(text: str, user_id: str) -> None:
     """在背景執行緒處理訊息，用 push_message 回傳結果（避免 reply token 超時）"""
     try:
+        is_command = any(text.startswith(c) for c in _COMMANDS)
+        # 快取 miss 且非指令 → 先送確認訊息
+        if not is_command and get_cached(text) is None:
+            _send(user_id, f"🔍 正在分析「{text}」的最新新聞，請稍候...")
         reply = _handle_command(text, user_id)
-        with ApiClient(configuration) as api_client:
-            MessagingApi(api_client).push_message(
-                PushMessageRequest(to=user_id, messages=[TextMessage(text=reply)])
-            )
+        _send(user_id, reply)
     except Exception as e:
         print(f"[ERROR] 處理訊息失敗：{e}")
 
