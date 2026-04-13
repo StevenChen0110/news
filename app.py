@@ -187,7 +187,7 @@ def shorten_url(url: str) -> str:
 
 # ── 新聞抓取 ──────────────────────────────────────────────────────────────
 def fetch_news(topic: str, count: int = 3) -> dict:
-    """回傳 {"items": [{"title": str, "link": str}]}，有快取時直接回傳"""
+    """回傳 {"summary": str, "items": [{"title": str, "link": str}]}，有快取時直接回傳"""
     cached = get_cached(topic)
     if cached is not None:
         return cached
@@ -242,10 +242,11 @@ def _fetch_fresh(topic: str, count: int = 3) -> dict:
     candidates = candidates[:20]  # 最多 20 篇供 AI 挑選
 
     if not candidates:
-        return {"items": []}
+        return {"summary": "", "items": []}
 
-    # ── AI 評估重要性排序 ─────────────────────────────────────────────
+    # ── AI 評估重要性排序 + 內容摘要 ────────────────────────────────────
     selected = candidates[:count]
+    summary = ""
     if claude and len(candidates) > count:
         try:
             news_lines = []
@@ -257,7 +258,7 @@ def _fetch_fresh(topic: str, count: int = 3) -> dict:
             news_text = "\n".join(news_lines)
             resp = claude.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=60,
+                max_tokens=200,
                 messages=[{
                     "role": "user",
                     "content": (
@@ -270,16 +271,20 @@ def _fetch_fresh(topic: str, count: int = 3) -> dict:
                         f"5. 事實密度（10%）：有具體數字/數據，而非情緒評論\n"
                         f"6. 避免重複：同一事件只選一則\n\n"
                         f"請嚴格按以下格式回覆：\n"
-                        f"RANKS:編號,編號,編號\n\n"
+                        f"RANKS:編號,編號,編號\n"
+                        f"SUMMARY:用2-3句繁體中文摘要這些新聞的核心內容重點（不要說明你如何選擇或評估）\n\n"
                         f"{news_text}"
                     )
                 }]
             )
             raw = resp.content[0].text.strip()
             ranks_m   = re.search(r"RANKS:\s*([0-9,\s]+)", raw)
+            summary_m = re.search(r"SUMMARY:\s*(.+)", raw, re.DOTALL)
             if ranks_m:
                 picks = [int(x.strip()) - 1 for x in ranks_m.group(1).split(",") if x.strip().isdigit()]
                 selected = [candidates[i] for i in picks if i < len(candidates)][:count]
+            if summary_m:
+                summary = summary_m.group(1).strip()
         except Exception as e:
             print(f"[WARN] AI 分析失敗：{e}")
 
@@ -289,6 +294,7 @@ def _fetch_fresh(topic: str, count: int = 3) -> dict:
     links = [shorten_url(u) for u in real_urls]
 
     return {
+        "summary": summary,
         "items": [{"title": c["title"], "link": l} for c, l in zip(selected, links)],
     }
 
@@ -298,6 +304,8 @@ def format_news(topic: str, result: dict) -> str:
     if not items:
         return f"「{topic}」目前找不到相關新聞"
     parts = [f"📰 {topic}"]
+    if result.get("summary"):
+        parts.append(f"\n{result['summary']}")
     for i, item in enumerate(items, 1):
         parts.append(f"\n{i}. {item['title']}\n🔗 {item['link']}")
     return "\n".join(parts)
