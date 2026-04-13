@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import re
+import html as html_lib
 import sqlite3
 import anthropic
 import requests
@@ -151,11 +152,32 @@ def fetch_news(topic: str, count: int = 3) -> dict:
 
     now = datetime.now(timezone.utc)
 
+    def clean_text(raw: str) -> str:
+        text = re.sub(r"<[^>]+>", " ", raw)
+        text = html_lib.unescape(text)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def age_label(pub: datetime | None) -> str:
+        if not pub:
+            return "時間不明"
+        diff = now - pub
+        hours = int(diff.total_seconds() / 3600)
+        if hours < 1:
+            return "不到1小時前"
+        if hours < 24:
+            return f"{hours}小時前"
+        return f"{diff.days}天前"
+
     def to_dict(e):
         pub = None
         if getattr(e, "published_parsed", None):
             pub = datetime(*e.published_parsed[:6], tzinfo=timezone.utc)
-        return {"title": e.title, "link": e.link, "published": pub}
+        raw_summary = getattr(e, "summary", "") or ""
+        summary = clean_text(raw_summary)
+        # Google News summary 有時只是標題重複，去掉
+        if summary.lower().startswith(e.title[:20].lower()):
+            summary = ""
+        return {"title": e.title, "link": e.link, "published": pub, "summary": summary}
 
     all_entries = [to_dict(e) for e in feed.entries[:20]]
 
@@ -177,23 +199,28 @@ def fetch_news(topic: str, count: int = 3) -> dict:
     # AI 重要性排序（DCEM 模型）
     if claude and len(candidates) > count:
         try:
-            news_text = "\n".join(
-                f"{i+1}. {n['title']}" for i, n in enumerate(candidates)
-            )
+            news_lines = []
+            for i, n in enumerate(candidates):
+                line = f"{i+1}. [{age_label(n['published'])}] {n['title']}"
+                if n.get("summary"):
+                    line += f"\n   摘錄：{n['summary'][:120]}"
+                news_lines.append(line)
+            news_text = "\n".join(news_lines)
             resp = claude.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=16,
                 messages=[{
                     "role": "user",
                     "content": (
-                        f"你是新聞重要性評估專家。以下是「{topic}」的新聞標題，"
+                        f"你是新聞重要性評估專家。以下是「{topic}」的新聞（含發布時間與摘錄），"
                         f"請依照下列標準選出最重要的 {count} 則：\n\n"
-                        f"【評估標準】\n"
-                        f"1. 影響規模：涉及範圍廣（跨產業/多國/大量人口）優先\n"
-                        f"2. 路徑決定性：結構性轉折、打破慣例、第一塊骨牌優先\n"
-                        f"3. 局勢連動：前提在當前仍成立（非過時背景）優先\n"
-                        f"4. 前瞻性：政策草案、技術突破等具先兆意義的優先\n"
-                        f"5. 避免重複：同一事件只選一則\n\n"
+                        f"【評估標準（依優先順序）】\n"
+                        f"1. 時效性（最高比重）：越新越優先；超過3天的舊聞需有極高價值才選\n"
+                        f"2. 影響規模：涉及範圍廣（跨產業/多國/大量人口）優先\n"
+                        f"3. 路徑決定性：結構性轉折、打破慣例、第一塊骨牌優先\n"
+                        f"4. 局勢連動：前提在當前仍成立（非過時背景）優先\n"
+                        f"5. 前瞻性：政策草案、技術突破等具先兆意義的優先\n"
+                        f"6. 避免重複：同一事件只選一則\n\n"
                         f"只回傳編號，用逗號分隔，例如：2,5,7\n\n"
                         f"{news_text}"
                     )
