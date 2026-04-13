@@ -310,9 +310,12 @@ def format_news(topic: str, result: dict) -> str:
         parts.append(f"\n{i}. {item['title']}\n🔗 {item['link']}")
     return "\n".join(parts)
 
-def format_news_message(topic: str, result: dict) -> TextMessage:
+def format_news_message(topic: str, result: dict, *, subscribed: bool = False) -> TextMessage:
     text = format_news(topic, result)
-    qr = _qr((f"📌 訂閱「{topic[:8]}」", f"訂閱 {topic}"), ("📋 我的訂閱", "我的訂閱"))
+    if subscribed:
+        qr = _qr((f"❌ 取消「{topic[:8]}」", f"取消訂閱 {topic}"), ("📋 我的訂閱", "我的訂閱"))
+    else:
+        qr = _qr((f"📌 訂閱「{topic[:8]}」", f"訂閱 {topic}"), ("📋 我的訂閱", "我的訂閱"))
     return _msg(text, qr)
 
 # ── Quick Reply 常用組合 ──────────────────────────────────────────────────
@@ -348,7 +351,7 @@ def do_scheduled_push(time_str: str) -> None:
             continue
         for topic in subs:
             try:
-                _send(user_id, format_news_message(topic, fetch_news(topic)))
+                _send(user_id, format_news_message(topic, fetch_news(topic), subscribed=True))
             except Exception as e:
                 print(f"[WARN] 推播失敗 {user_id}/{topic}：{e}")
     print(f"[INFO] {time_str} 推播完成，{len(users)} 位用戶")
@@ -459,10 +462,16 @@ def _handle_command(text: str, user_id: str) -> TextMessage:
         subs = get_subscriptions(user_id)
         if subs:
             body = "📋 訂閱主題：\n" + "\n".join(f"• {t}" for t in subs)
-            body += "\n\n要取消請輸入：取消訂閱 <主題>"
+            body += "\n\n點下方按鈕可快速取消訂閱 👇"
+            # 每個主題一個取消按鈕，最多 11 個（保留 2 個給固定按鈕）
+            unsub_buttons = [
+                (f"❌ {t[:10]}", f"取消訂閱 {t}") for t in subs[:11]
+            ]
+            qr = _qr(*unsub_buttons, ("⏰ 推送時間", "推送時間"), ("❓ 說明", "說明"))
         else:
             body = "目前沒有訂閱主題\n\n輸入「訂閱 <主題>」來新增"
-        return _msg(body, QR_SUBS)
+            qr = QR_SUBS
+        return _msg(body, qr)
 
     # ── 推送時間管理 ──
     if text == "推送時間":
@@ -509,7 +518,8 @@ def _handle_command(text: str, user_id: str) -> TextMessage:
         )
 
     # 預設：即時查詢
-    return format_news_message(text, fetch_news(text))
+    is_subscribed = text in get_subscriptions(user_id)
+    return format_news_message(text, fetch_news(text), subscribed=is_subscribed)
 
 # ── 備用推播 endpoint ─────────────────────────────────────────────────────
 @app.route("/trigger-push", methods=["POST"])
@@ -521,7 +531,7 @@ def trigger_push():
         subs = get_subscriptions(user_id)
         for topic in subs:
             try:
-                _send(user_id, format_news_message(topic, fetch_news(topic)))
+                _send(user_id, format_news_message(topic, fetch_news(topic), subscribed=True))
             except Exception as e:
                 print(f"[WARN] trigger-push 失敗 {user_id}/{topic}：{e}")
     return "ok", 200
