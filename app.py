@@ -174,18 +174,28 @@ def fetch_news(topic: str, count: int = 3) -> dict:
     if not candidates:
         return {"summary": "", "items": []}
 
-    # AI 重要性排序
+    # AI 重要性排序（DCEM 模型）
     if claude and len(candidates) > count:
         try:
-            news_text = "\n".join(f"{i+1}. {n['title']}" for i, n in enumerate(candidates))
+            news_text = "\n".join(
+                f"{i+1}. {n['title']}" for i, n in enumerate(candidates)
+            )
             resp = claude.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=32,
+                max_tokens=16,
                 messages=[{
                     "role": "user",
                     "content": (
-                        f"以下是「{topic}」的新聞標題，選出最重要的 {count} 則，"
-                        f"只回傳編號用逗號分隔，例如：2,5,7\n\n{news_text}"
+                        f"你是新聞重要性評估專家。以下是「{topic}」的新聞標題，"
+                        f"請依照下列標準選出最重要的 {count} 則：\n\n"
+                        f"【評估標準】\n"
+                        f"1. 影響規模：涉及範圍廣（跨產業/多國/大量人口）優先\n"
+                        f"2. 路徑決定性：結構性轉折、打破慣例、第一塊骨牌優先\n"
+                        f"3. 局勢連動：前提在當前仍成立（非過時背景）優先\n"
+                        f"4. 前瞻性：政策草案、技術突破等具先兆意義的優先\n"
+                        f"5. 避免重複：同一事件只選一則\n\n"
+                        f"只回傳編號，用逗號分隔，例如：2,5,7\n\n"
+                        f"{news_text}"
                     )
                 }]
             )
