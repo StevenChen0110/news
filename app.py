@@ -391,7 +391,9 @@ def register_push_jobs() -> None:
     )
 
 # ── Webhook ───────────────────────────────────────────────────────────────
-_COMMANDS = ("訂閱", "取消訂閱", "我的訂閱", "推送時間", "新增推送時間", "刪除推送時間", "說明", "help", "?", "？")
+_COMMANDS = ("訂閱", "取消訂閱", "批次取消訂閱", "我的訂閱",
+             "推送時間", "新增推送時間", "刪除推送時間", "批次刪除推送時間",
+             "說明", "help", "?", "？")
 
 def _process_event(text: str, user_id: str) -> None:
     """在背景執行緒處理訊息，用 push_message 回傳結果（避免 reply token 超時）"""
@@ -450,6 +452,21 @@ def _handle_command(text: str, user_id: str) -> TextMessage:
             return _msg(f"✅ 已訂閱「{topic}」\n\n之後每次推播都會包含此主題", QR_AFTER_SUB)
         return _msg(f"「{topic}」已在訂閱清單", QR_AFTER_SUB)
 
+    if text.startswith("批次取消訂閱 "):
+        raw = text[7:].strip()
+        topics = [t.strip() for t in raw.replace("，", ",").split(",") if t.strip()]
+        if not topics:
+            return _msg("請輸入主題，以逗號分隔\n例如：批次取消訂閱 科技,AI,體育")
+        removed, skipped = [], []
+        for t in topics:
+            (removed if remove_subscription(user_id, t) else skipped).append(t)
+        lines = []
+        if removed:
+            lines.append(f"✅ 已取消訂閱：{', '.join(removed)}")
+        if skipped:
+            lines.append(f"⚠️ 不在清單中：{', '.join(skipped)}")
+        return _msg("\n".join(lines), _qr(("📋 我的訂閱", "我的訂閱"), ("⏰ 推送時間", "推送時間")))
+
     if text.startswith("取消訂閱 "):
         topic = text[5:].strip()
         if not topic:
@@ -465,9 +482,12 @@ def _handle_command(text: str, user_id: str) -> TextMessage:
             body += "\n\n點下方按鈕可快速取消訂閱 👇"
             # 每個主題一個取消按鈕，最多 11 個（保留 2 個給固定按鈕）
             unsub_buttons = [
-                (f"❌ {t[:10]}", f"取消訂閱 {t}") for t in subs[:11]
+                (f"❌ {t[:10]}", f"取消訂閱 {t}") for t in subs[:10]
             ]
-            qr = _qr(*unsub_buttons, ("⏰ 推送時間", "推送時間"), ("❓ 說明", "說明"))
+            if len(subs) > 1:
+                all_topics_str = ",".join(subs)
+                unsub_buttons.append(("🗑 全部取消", f"批次取消訂閱 {all_topics_str}"))
+            qr = _qr(*unsub_buttons, ("⏰ 推送時間", "推送時間"))
         else:
             body = "目前沒有訂閱主題\n\n輸入「訂閱 <主題>」來新增"
             qr = QR_SUBS
@@ -478,10 +498,15 @@ def _handle_command(text: str, user_id: str) -> TextMessage:
         times = get_push_times(user_id)
         if times:
             body = "⏰ 推送時間：\n" + "\n".join(f"• {t}" for t in times)
-            body += "\n\n新增：新增推送時間 HH:MM\n刪除：刪除推送時間 HH:MM"
+            body += "\n\n點下方按鈕可快速刪除 👇"
+            del_buttons = [(f"🗑 {t}", f"刪除推送時間 {t}") for t in times[:10]]
+            all_times_str = ",".join(times)
+            del_buttons.append((f"🗑 全部刪除", f"批次刪除推送時間 {all_times_str}"))
+            qr = _qr(*del_buttons, ("📋 我的訂閱", "我的訂閱"))
         else:
             body = "目前沒有設定推送時間\n\n輸入「新增推送時間 HH:MM」來新增"
-        return _msg(body, QR_TIMES)
+            qr = QR_TIMES
+        return _msg(body, qr)
 
     if text.startswith("新增推送時間 "):
         t = text[7:].strip()
@@ -491,6 +516,23 @@ def _handle_command(text: str, user_id: str) -> TextMessage:
             register_push_jobs()
             return _msg(f"✅ 已新增推送時間 {t}", QR_TIMES)
         return _msg(f"⏰ {t} 已在推送清單", QR_TIMES)
+
+    if text.startswith("批次刪除推送時間 "):
+        raw = text[8:].strip()
+        items = [t.strip() for t in raw.replace("，", ",").split(",") if t.strip()]
+        if not items:
+            return _msg("請輸入時間，以逗號分隔\n例如：批次刪除推送時間 08:00,12:00")
+        removed, skipped = [], []
+        for t in items:
+            (removed if remove_push_time(user_id, t) else skipped).append(t)
+        if removed:
+            register_push_jobs()
+        lines = []
+        if removed:
+            lines.append(f"✅ 已刪除推送時間：{', '.join(removed)}")
+        if skipped:
+            lines.append(f"⚠️ 不在清單中：{', '.join(skipped)}")
+        return _msg("\n".join(lines), _qr(("⏰ 推送時間", "推送時間"), ("📋 我的訂閱", "我的訂閱")))
 
     if text.startswith("刪除推送時間 "):
         t = text[7:].strip()
@@ -509,11 +551,13 @@ def _handle_command(text: str, user_id: str) -> TextMessage:
             "【訂閱管理】\n"
             "訂閱 <主題>　　新增定時推播\n"
             "取消訂閱 <主題>　移除\n"
+            "批次取消訂閱 A,B,C　一次移除多個\n"
             "我的訂閱　　　查看清單\n\n"
             "【推送時間】\n"
             "推送時間　　　　查看設定\n"
             "新增推送時間 HH:MM\n"
-            "刪除推送時間 HH:MM",
+            "刪除推送時間 HH:MM\n"
+            "批次刪除推送時間 HH:MM,HH:MM",
             QR_MAIN
         )
 
