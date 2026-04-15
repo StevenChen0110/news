@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import re
+import time
 import html as html_lib
 import sqlite3
 import anthropic
@@ -160,29 +161,60 @@ def remove_push_time(user_id: str, t: str) -> bool:
         ).rowcount > 0
 
 # ── 取得實際文章網址（跟隨 Google News 轉址）────────────────────────────
+_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
+
 def resolve_url(url: str) -> str:
     try:
-        r = requests.get(url, allow_redirects=True, timeout=5, stream=True)
+        r = requests.get(
+            url,
+            allow_redirects=True,
+            timeout=8,
+            stream=True,
+            headers={"User-Agent": _UA},
+        )
+        final = r.url
         r.close()
-        return r.url
-    except Exception:
+        return final
+    except Exception as e:
+        print(f"[WARN] resolve_url 失敗 {url[:80]}...：{type(e).__name__}")
         return url
 
 def shorten_url(url: str) -> str:
     if not REURL_API_KEY:
         return url
-    try:
-        r = requests.post(
-            "https://api.reurl.cc/shorten",
-            json={"url": url},
-            headers={"Content-Type": "application/json", "reurl-api-key": REURL_API_KEY},
-            timeout=5,
-        )
-        data = r.json()
-        if data.get("res") == "success":
-            return data["short_url"]
-    except Exception:
-        pass
+    # reurl 要求 http/https 開頭
+    if not url.startswith(("http://", "https://")):
+        return url
+    # 已經是 reurl 短網址就不再縮
+    if "reurl.cc" in url:
+        return url
+    for attempt in range(2):
+        try:
+            r = requests.post(
+                "https://api.reurl.cc/shorten",
+                json={"url": url},
+                headers={"Content-Type": "application/json", "reurl-api-key": REURL_API_KEY},
+                timeout=10,
+            )
+            # 429 = rate limit：稍等後重試
+            if r.status_code == 429:
+                print(f"[WARN] reurl 429 rate limit，重試中...")
+                time.sleep(1.0)
+                continue
+            try:
+                data = r.json()
+            except ValueError:
+                print(f"[WARN] reurl 非 JSON 回應 (HTTP {r.status_code})：{r.text[:200]}")
+                return url
+            if data.get("res") == "success" and data.get("short_url"):
+                return data["short_url"]
+            print(f"[WARN] reurl 失敗 (HTTP {r.status_code})：{data}")
+            return url
+        except requests.Timeout:
+            print(f"[WARN] reurl timeout (attempt {attempt+1})")
+        except Exception as e:
+            print(f"[WARN] reurl 例外：{type(e).__name__}: {e}")
+            return url
     return url
 
 # ── 新聞抓取 ──────────────────────────────────────────────────────────────
@@ -288,10 +320,14 @@ def _fetch_fresh(topic: str, count: int = 3) -> dict:
         except Exception as e:
             print(f"[WARN] AI 分析失敗：{e}")
 
-    # 平行解析 URL，依序縮網址
+    # 平行解析 URL，依序縮網址（中間稍等避免 rate limit）
     with ThreadPoolExecutor(max_workers=len(selected)) as ex:
         real_urls = list(ex.map(resolve_url, [c["link"] for c in selected]))
-    links = [shorten_url(u) for u in real_urls]
+    links = []
+    for i, u in enumerate(real_urls):
+        if i > 0:
+            time.sleep(0.3)
+        links.append(shorten_url(u))
 
     return {
         "summary": summary,
