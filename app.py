@@ -2,6 +2,7 @@
 import os
 import re
 import time
+import secrets
 import html as html_lib
 import sqlite3
 import anthropic
@@ -22,7 +23,7 @@ from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from linebot.v3.messaging import (
     Configuration, ApiClient, MessagingApi,
     ReplyMessageRequest, TextMessage,
-    PushMessageRequest, QuickReply, QuickReplyItem, MessageAction,
+    PushMessageRequest, QuickReply, QuickReplyItem, MessageAction, URIAction,
 )
 
 app = Flask(__name__)
@@ -35,7 +36,14 @@ DB_PATH              = os.getenv("DB_PATH", "subscriptions.db")
 ANTHROPIC_API_KEY    = os.getenv("ANTHROPIC_API_KEY")
 REURL_API_KEY        = os.getenv("REURL_API_KEY")
 ADMIN_PASSWORD       = os.getenv("ADMIN_PASSWORD", "admin123")
+BASE_URL             = os.getenv("BASE_URL", "").rstrip("/")  # 例：https://your-app.onrender.com
 app.secret_key       = os.getenv("SECRET_KEY", os.urandom(24))
+# 讓 session 在 LINE 內建瀏覽器中持久保存
+app.config.update(
+    PERMANENT_SESSION_LIFETIME=timedelta(days=30),
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(BASE_URL.startswith("https://")),
+)
 
 claude        = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
 parser        = WebhookParser(CHANNEL_SECRET)
@@ -84,6 +92,14 @@ def init_db() -> None:
                 user_id TEXT NOT NULL,
                 time    TEXT NOT NULL,
                 PRIMARY KEY (user_id, time)
+            )
+        """)
+        # Magic link 一次性登入 token
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS login_tokens (
+                token      TEXT PRIMARY KEY,
+                user_id    TEXT NOT NULL,
+                expires_at TEXT NOT NULL
             )
         """)
 
@@ -159,6 +175,33 @@ def remove_push_time(user_id: str, t: str) -> bool:
         return conn.execute(
             "DELETE FROM push_times WHERE user_id=? AND time=?", (user_id, t)
         ).rowcount > 0
+
+# ── Magic Link ────────────────────────────────────────────────────────────
+LOGIN_TOKEN_TTL = timedelta(minutes=10)
+
+def create_login_token(user_id: str) -> str:
+    token = secrets.token_urlsafe(24)
+    expires = (datetime.now(timezone.utc) + LOGIN_TOKEN_TTL).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        # 順手清理過期 token
+        conn.execute("DELETE FROM login_tokens WHERE expires_at < ?",
+                     (datetime.now(timezone.utc).isoformat(),))
+        conn.execute("INSERT INTO login_tokens VALUES (?,?,?)", (token, user_id, expires))
+    return token
+
+def consume_login_token(token: str) -> str | None:
+    """驗證 token 並刪除（一次性使用）。回傳 user_id 或 None。"""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT user_id, expires_at FROM login_tokens WHERE token=?", (token,)
+        ).fetchone()
+        if not row:
+            return None
+        user_id, expires_at = row
+        conn.execute("DELETE FROM login_tokens WHERE token=?", (token,))
+        if datetime.fromisoformat(expires_at) < datetime.now(timezone.utc):
+            return None
+        return user_id
 
 # ── 取得實際文章網址（跟隨 Google News 轉址）────────────────────────────
 _UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
@@ -361,10 +404,34 @@ def _qr(*labels_and_texts: tuple[str, str]) -> QuickReply:
         for label, text in labels_and_texts
     ])
 
-QR_MAIN     = _qr(("📋 我的訂閱", "我的訂閱"), ("⏰ 推送時間", "推送時間"), ("❓ 說明", "說明"))
-QR_SUBS     = _qr(("⏰ 推送時間", "推送時間"), ("❓ 說明", "說明"))
-QR_TIMES    = _qr(("📋 我的訂閱", "我的訂閱"), ("❓ 說明", "說明"))
+QR_MAIN     = _qr(("⚙️ 進階設定", "設定"), ("📋 我的訂閱", "我的訂閱"), ("⏰ 推送時間", "推送時間"), ("❓ 說明", "說明"))
+QR_SUBS     = _qr(("⚙️ 進階設定", "設定"), ("⏰ 推送時間", "推送時間"), ("❓ 說明", "說明"))
+QR_TIMES    = _qr(("⚙️ 進階設定", "設定"), ("📋 我的訂閱", "我的訂閱"), ("❓ 說明", "說明"))
 QR_AFTER_SUB = _qr(("📋 我的訂閱", "我的訂閱"), ("⏰ 推送時間", "推送時間"))
+
+def settings_message(user_id: str) -> TextMessage:
+    """產生包含 magic link 的設定訊息（用 URIAction 讓用戶點了直接開網頁）"""
+    if not BASE_URL:
+        return _msg("⚠️ 尚未設定 BASE_URL 環境變數，無法產生進階設定連結。\n請改用聊天指令管理訂閱。", QR_MAIN)
+    token = create_login_token(user_id)
+    url = f"{BASE_URL}/login/{token}"
+    qr = QuickReply(items=[
+        QuickReplyItem(action=URIAction(label="🔗 開啟設定頁", uri=url)),
+        QuickReplyItem(action=MessageAction(label="📋 我的訂閱", text="我的訂閱")),
+        QuickReplyItem(action=MessageAction(label="⏰ 推送時間", text="推送時間")),
+    ])
+    return TextMessage(
+        text=(
+            "⚙️ 進階設定\n\n"
+            "點下方「🔗 開啟設定頁」按鈕，\n"
+            "即可在網頁介面中：\n"
+            "• 多選批次取消訂閱\n"
+            "• 視覺化管理推送時間\n"
+            "• 快速新增 / 調整設定\n\n"
+            "⏱ 連結 10 分鐘內有效"
+        ),
+        quick_reply=qr,
+    )
 
 def _msg(text: str, quick_reply: QuickReply | None = None) -> TextMessage:
     return TextMessage(text=text, quick_reply=quick_reply)
@@ -429,7 +496,7 @@ def register_push_jobs() -> None:
 # ── Webhook ───────────────────────────────────────────────────────────────
 _COMMANDS = ("訂閱", "取消訂閱", "批次取消訂閱", "我的訂閱",
              "推送時間", "新增推送時間", "刪除推送時間", "批次刪除推送時間",
-             "說明", "help", "?", "？")
+             "設定", "說明", "help", "?", "？")
 
 def _process_event(text: str, user_id: str) -> None:
     """在背景執行緒處理訊息，用 push_message 回傳結果（避免 reply token 超時）"""
@@ -443,6 +510,7 @@ def _process_event(text: str, user_id: str) -> None:
                 f"已為你設定預設訂閱：{', '.join(DEFAULT_TOPICS)}\n"
                 f"推送時間：{', '.join(DEFAULT_TIMES)}\n\n"
                 "直接輸入關鍵字可即時查詢新聞\n"
+                "輸入「設定」可開啟進階設定網頁\n"
                 "點下方按鈕管理你的設定 👇",
                 QR_MAIN
             ))
@@ -479,6 +547,10 @@ def callback():
     return "OK"
 
 def _handle_command(text: str, user_id: str) -> TextMessage:
+    # ── 進階設定（Magic Link） ──
+    if text == "設定":
+        return settings_message(user_id)
+
     # ── 訂閱管理 ──
     if text.startswith("訂閱 "):
         topic = text[3:].strip()
@@ -584,6 +656,9 @@ def _handle_command(text: str, user_id: str) -> TextMessage:
             "【即時查詢】\n"
             "直接輸入任何關鍵字\n"
             "例：台積電、升息、世界盃\n\n"
+            "【進階設定（推薦）】\n"
+            "輸入「設定」開啟網頁管理介面\n"
+            "支援多選、批次操作、視覺化\n\n"
             "【訂閱管理】\n"
             "訂閱 <主題>　　新增定時推播\n"
             "取消訂閱 <主題>　移除\n"
@@ -895,8 +970,291 @@ def admin_login():
 
 @app.route("/admin/logout")
 def admin_logout():
-    session.clear()
+    session.pop("admin", None)
     return redirect(url_for("admin_login"))
+
+# ── 用戶自助設定頁（Magic Link 登入） ──────────────────────────────────────
+USER_SETTINGS_HTML = """
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>我的設定</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, sans-serif; background: #f5f5f5; color: #333; padding-bottom: 40px; }
+  .container { max-width: 560px; margin: 0 auto; padding: 20px; }
+  .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+  .header h1 { font-size: 19px; color: #111; }
+  .header .logout { font-size: 13px; color: #999; text-decoration: none; }
+  .header .logout:hover { color: #e00; }
+  .flash { background: #d4f5e1; color: #0a6b2e; border-radius: 10px;
+           padding: 12px 16px; margin-bottom: 16px; font-size: 14px; }
+  .card { background: #fff; border-radius: 14px; padding: 20px; margin-bottom: 16px;
+          box-shadow: 0 1px 4px rgba(0,0,0,.06); }
+  .card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; }
+  .card-header h2 { font-size: 14px; color: #666; text-transform: uppercase; letter-spacing: .5px; }
+  .count { font-size: 12px; color: #aaa; }
+  .item-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
+  .item { display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+          background: #fafafa; border-radius: 10px; cursor: pointer;
+          transition: background .15s; }
+  .item:hover { background: #f0f0f0; }
+  .item input[type=checkbox] { width: 18px; height: 18px; accent-color: #06c755; cursor: pointer; }
+  .item label { flex: 1; font-size: 15px; cursor: pointer; }
+  .batch-bar { display: flex; gap: 8px; align-items: center; margin-bottom: 14px;
+               padding: 10px 12px; background: #fff3cd; border-radius: 10px;
+               font-size: 13px; display: none; }
+  .batch-bar.active { display: flex; }
+  .batch-bar .selected-count { flex: 1; color: #664d03; }
+  .batch-bar button { background: #e74c3c; color: #fff; border: none;
+                      border-radius: 8px; padding: 6px 14px; font-size: 13px;
+                      cursor: pointer; font-weight: 600; }
+  .batch-bar button:hover { background: #c0392b; }
+  .add-row { display: flex; gap: 8px; }
+  .add-row input { flex: 1; border: 1px solid #ddd; border-radius: 10px;
+                   padding: 11px 14px; font-size: 15px; outline: none;
+                   -webkit-appearance: none; }
+  .add-row input:focus { border-color: #06c755; }
+  .add-row button { background: #06c755; color: #fff; border: none; border-radius: 10px;
+                    padding: 11px 20px; font-size: 15px; cursor: pointer; font-weight: 600; }
+  .add-row button:hover { background: #05b04c; }
+  .empty { color: #aaa; font-size: 14px; text-align: center; padding: 18px 0; }
+  .tip { font-size: 12px; color: #999; margin-top: 8px; }
+  .select-all-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+                    font-size: 13px; color: #666; cursor: pointer; user-select: none; }
+  .select-all-row input { width: 16px; height: 16px; accent-color: #06c755; }
+  .time-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(80px, 1fr)); gap: 6px; }
+  .time-item { text-align: center; padding: 10px 4px; background: #fafafa;
+               border-radius: 8px; cursor: pointer; position: relative; }
+  .time-item:hover { background: #f0f0f0; }
+  .time-item.checked { background: #d4f5e1; }
+  .time-item input { position: absolute; opacity: 0; pointer-events: none; }
+  .time-item label { cursor: pointer; display: block; font-size: 15px; font-weight: 500; }
+  .footer { text-align: center; font-size: 12px; color: #bbb; margin-top: 28px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>📰 我的設定</h1>
+    <a href="/me/logout" class="logout">登出</a>
+  </div>
+
+  {% if flash %}<div class="flash">{{ flash }}</div>{% endif %}
+
+  <!-- 訂閱主題 -->
+  <div class="card">
+    <div class="card-header">
+      <h2>📋 訂閱主題</h2>
+      <span class="count">{{ subs|length }} 個</span>
+    </div>
+
+    {% if subs %}
+    <form method="post" action="/me/subs/batch-remove" id="subs-form">
+      <label class="select-all-row">
+        <input type="checkbox" id="subs-select-all">
+        <span>全選 / 全不選</span>
+      </label>
+      <div class="item-list">
+        {% for t in subs %}
+        <div class="item">
+          <input type="checkbox" name="topics" value="{{ t }}" id="sub-{{ loop.index }}" class="sub-cb">
+          <label for="sub-{{ loop.index }}">{{ t }}</label>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="batch-bar" id="subs-bar">
+        <span class="selected-count"><span id="subs-count">0</span> 個已選取</span>
+        <button type="submit" onclick="return confirm('確定要取消選取的訂閱？')">🗑 批次刪除</button>
+      </div>
+    </form>
+    {% else %}
+    <p class="empty">目前沒有訂閱主題<br><span style="font-size:12px">在下方輸入新主題吧</span></p>
+    {% endif %}
+
+    <form method="post" action="/me/subs/add" class="add-row">
+      <input name="topic" placeholder="輸入新主題，例如：體育" required autocomplete="off">
+      <button type="submit">新增</button>
+    </form>
+    <p class="tip">💡 每個主題每天在推送時間會自動抓取 3 則最重要新聞</p>
+  </div>
+
+  <!-- 推送時間 -->
+  <div class="card">
+    <div class="card-header">
+      <h2>⏰ 推送時間</h2>
+      <span class="count">{{ times|length }} 個</span>
+    </div>
+
+    {% if times %}
+    <form method="post" action="/me/times/batch-remove" id="times-form">
+      <label class="select-all-row">
+        <input type="checkbox" id="times-select-all">
+        <span>全選 / 全不選</span>
+      </label>
+      <div class="time-grid">
+        {% for t in times %}
+        <div class="time-item" data-time-item>
+          <input type="checkbox" name="times" value="{{ t }}" id="time-{{ loop.index }}" class="time-cb">
+          <label for="time-{{ loop.index }}">⏰ {{ t }}</label>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="batch-bar" id="times-bar" style="margin-top: 10px;">
+        <span class="selected-count"><span id="times-count">0</span> 個已選取</span>
+        <button type="submit" onclick="return confirm('確定要刪除選取的推送時間？')">🗑 批次刪除</button>
+      </div>
+    </form>
+    {% else %}
+    <p class="empty">目前沒有推送時間<br><span style="font-size:12px">在下方新增吧</span></p>
+    {% endif %}
+
+    <form method="post" action="/me/times/add" class="add-row" style="margin-top: 14px;">
+      <input name="time" type="time" required>
+      <button type="submit">新增</button>
+    </form>
+    <p class="tip">💡 時區為台灣時間（Asia/Taipei）</p>
+  </div>
+
+  <div class="footer">設定即時生效</div>
+</div>
+
+<script>
+  // 多選 checkbox 同步 UI
+  function setupBatch(formId, cbClass, allId, barId, countId) {
+    const cbs = document.querySelectorAll('.' + cbClass);
+    const all = document.getElementById(allId);
+    const bar = document.getElementById(barId);
+    const count = document.getElementById(countId);
+    if (!cbs.length || !all) return;
+
+    function update() {
+      const selected = [...cbs].filter(c => c.checked).length;
+      count.textContent = selected;
+      bar.classList.toggle('active', selected > 0);
+      all.checked = selected === cbs.length;
+      all.indeterminate = selected > 0 && selected < cbs.length;
+      // 時間格子的選中樣式
+      cbs.forEach(c => {
+        const parent = c.closest('[data-time-item]');
+        if (parent) parent.classList.toggle('checked', c.checked);
+      });
+    }
+    cbs.forEach(c => c.addEventListener('change', update));
+    all.addEventListener('change', () => {
+      cbs.forEach(c => c.checked = all.checked);
+      update();
+    });
+    // time-item 整塊可點
+    document.querySelectorAll('[data-time-item]').forEach(div => {
+      div.addEventListener('click', (e) => {
+        if (e.target.tagName === 'LABEL' || e.target.tagName === 'INPUT') return;
+        const cb = div.querySelector('input[type=checkbox]');
+        cb.checked = !cb.checked;
+        update();
+      });
+    });
+    update();
+  }
+  setupBatch('subs-form', 'sub-cb', 'subs-select-all', 'subs-bar', 'subs-count');
+  setupBatch('times-form', 'time-cb', 'times-select-all', 'times-bar', 'times-count');
+</script>
+</body>
+</html>
+"""
+
+def me_required(f):
+    from functools import wraps
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("user_id"):
+            return (
+                "<div style='font-family:sans-serif;text-align:center;padding:60px 20px;color:#666'>"
+                "<h2>🔒 請先從 LINE Bot 取得登入連結</h2>"
+                "<p style='margin-top:12px;font-size:14px'>在聊天室輸入「設定」取得 10 分鐘有效的登入連結</p>"
+                "</div>", 401
+            )
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route("/login/<token>")
+def magic_login(token: str):
+    user_id = consume_login_token(token)
+    if not user_id:
+        return (
+            "<div style='font-family:sans-serif;text-align:center;padding:60px 20px;color:#666'>"
+            "<h2>⚠️ 連結已失效</h2>"
+            "<p style='margin-top:12px;font-size:14px'>連結僅 10 分鐘內有效且只能使用一次。<br>請回到 LINE Bot 輸入「設定」取得新連結</p>"
+            "</div>", 401
+        )
+    session.permanent = True
+    session["user_id"] = user_id
+    return redirect(url_for("me_index"))
+
+@app.route("/me")
+@me_required
+def me_index():
+    flash = session.pop("_flash", None)
+    return render_template_string(
+        USER_SETTINGS_HTML,
+        subs=get_subscriptions(session["user_id"]),
+        times=get_push_times(session["user_id"]),
+        flash=flash,
+    )
+
+@app.route("/me/logout")
+def me_logout():
+    session.pop("user_id", None)
+    return (
+        "<div style='font-family:sans-serif;text-align:center;padding:60px 20px;color:#666'>"
+        "<h2>👋 已登出</h2>"
+        "<p style='margin-top:12px;font-size:14px'>回到 LINE Bot 輸入「設定」可重新登入</p>"
+        "</div>"
+    )
+
+@app.route("/me/subs/add", methods=["POST"])
+@me_required
+def me_subs_add():
+    topic = request.form.get("topic", "").strip()
+    if topic:
+        if add_subscription(session["user_id"], topic):
+            session["_flash"] = f"✅ 已新增訂閱「{topic}」"
+        else:
+            session["_flash"] = f"「{topic}」已在訂閱清單"
+    return redirect(url_for("me_index"))
+
+@app.route("/me/subs/batch-remove", methods=["POST"])
+@me_required
+def me_subs_batch_remove():
+    topics = request.form.getlist("topics")
+    removed = [t for t in topics if remove_subscription(session["user_id"], t)]
+    if removed:
+        session["_flash"] = f"✅ 已取消訂閱：{'、'.join(removed)}"
+    return redirect(url_for("me_index"))
+
+@app.route("/me/times/add", methods=["POST"])
+@me_required
+def me_times_add():
+    t = request.form.get("time", "").strip()
+    if re.match(r"^\d{2}:\d{2}$", t):
+        if add_push_time(session["user_id"], t):
+            register_push_jobs()
+            session["_flash"] = f"✅ 已新增推送時間 {t}"
+        else:
+            session["_flash"] = f"⏰ {t} 已在清單中"
+    return redirect(url_for("me_index"))
+
+@app.route("/me/times/batch-remove", methods=["POST"])
+@me_required
+def me_times_batch_remove():
+    items = request.form.getlist("times")
+    removed = [t for t in items if remove_push_time(session["user_id"], t)]
+    if removed:
+        register_push_jobs()
+        session["_flash"] = f"✅ 已刪除推送時間：{'、'.join(removed)}"
+    return redirect(url_for("me_index"))
 
 # ── 啟動 ──────────────────────────────────────────────────────────────────
 init_db()
